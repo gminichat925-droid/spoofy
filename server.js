@@ -12,31 +12,31 @@ app.use(cors());
 const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 
-// 1. Auto-create cookies.txt from environment variable on server boot
 if (process.env.YOUTUBE_COOKIES) {
   fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES);
-  console.log('Successfully created cookies.txt from environment variable.');
+  console.log('Successfully created cookies.txt');
 }
 
-// 2. Health check root endpoint
 app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'Music Backend is running!' });
 });
 
-// 3. Audio stream extraction endpoint
 app.get('/api/stream', async (req, res) => {
   try {
     const { videoId } = req.query;
     if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
     const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
-
-    // Use local downloaded binary if available, fallback to global yt-dlp
     const binary = fs.existsSync(YTDLP_PATH) ? `"${YTDLP_PATH}"` : 'yt-dlp';
 
-    let command = `${binary} --no-playlist --force-ipv4 -g -f "ba[ext=m4a]/ba/b" "${targetUrl}"`;
+    // Added flags:
+    // --js-runtimes node : Uses Node.js to solve YouTube's JS n-challenge
+    // --extractor-args "youtube:player_client=android,web" : Bypasses SABR restrictions
+    let flags = `--no-playlist --force-ipv4 --js-runtimes node --extractor-args "youtube:player_client=android,web" -g -f "ba/b"`;
+
+    let command = `${binary} ${flags} "${targetUrl}"`;
     if (fs.existsSync(COOKIES_PATH)) {
-      command = `${binary} --cookies "${COOKIES_PATH}" --no-playlist --force-ipv4 -g -f "ba[ext=m4a]/ba/b" "${targetUrl}"`;
+      command = `${binary} --cookies "${COOKIES_PATH}" ${flags} "${targetUrl}"`;
     }
 
     const { stdout } = await execPromise(command);
@@ -54,6 +54,5 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// 4. Bind to PORT provided by Railway
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
