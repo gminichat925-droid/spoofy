@@ -36,11 +36,14 @@ app.get('/api/stream', async (req, res) => {
     if (!streamUrl) return res.status(404).json({ error: 'No stream found' });
 
     res.json({ streamUrl });
-  } catch (error) {
+} catch (error) {
     console.error('yt-dlp Error:', error.message);
-    res.status(500).json({ error: 'Stream extraction failed' });
+    // Include error.message in the response so you can read it in the browser
+    res.status(500).json({ 
+      error: 'Stream extraction failed', 
+      details: error.message 
+    });
   }
-});
 
 // 2. Bind to process.env.PORT provided by Railway
 const PORT = process.env.PORT || 3000;
