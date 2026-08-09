@@ -10,6 +10,7 @@ const app = express();
 app.use(cors());
 
 const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 
 // 1. Auto-create cookies.txt from environment variable on server boot
 if (process.env.YOUTUBE_COOKIES) {
@@ -30,9 +31,12 @@ app.get('/api/stream', async (req, res) => {
 
     const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-    let command = `yt-dlp --no-playlist --force-ipv4 -g -f "ba[ext=m4a]/ba/b" "${targetUrl}"`;
+    // Use local downloaded binary if available, fallback to global yt-dlp
+    const binary = fs.existsSync(YTDLP_PATH) ? `"${YTDLP_PATH}"` : 'yt-dlp';
+
+    let command = `${binary} --no-playlist --force-ipv4 -g -f "ba[ext=m4a]/ba/b" "${targetUrl}"`;
     if (fs.existsSync(COOKIES_PATH)) {
-      command = `yt-dlp --cookies "${COOKIES_PATH}" --no-playlist --force-ipv4 -g -f "ba[ext=m4a]/ba/b" "${targetUrl}"`;
+      command = `${binary} --cookies "${COOKIES_PATH}" --no-playlist --force-ipv4 -g -f "ba[ext=m4a]/ba/b" "${targetUrl}"`;
     }
 
     const { stdout } = await execPromise(command);
