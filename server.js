@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
 
-// Initialize express app BEFORE defining routes
 const app = express();
 app.use(cors());
 
@@ -13,14 +12,13 @@ const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
 
 const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
-// Apple Music token for motion artwork extraction
-const APPLE_MUSIC_TOKEN =
-  'eyJhbGciOiJFUzI1NicbdHlwIjoiSldUIiwia2lkIjI3N01MVE1IUFkifQ.eyJpc3MiOiJBMjI4VEpaNzRTIiwiaWF0IjoxNzA4MDY3MjAwLCJleHAiOjE3NzA2MDM2MDB9.sample';
-
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
-// 1. Refresh Access Token automatically with r_usr w_usr scopes
+let cachedAppleToken = null;
+let appleTokenExpiresAt = 0;
+
+// 1. Refresh Tidal Access Token
 async function getAccessToken() {
   if (!REFRESH_TOKEN) {
     throw new Error('TIDAL_REFRESH_TOKEN environment variable is missing on Railway.');
@@ -56,7 +54,42 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
-// 2. Fetch Direct Stream URL from Tidal Manifest
+// 2. Dynamically Scrape Live Apple Music Developer Token
+async function getAppleDeveloperToken() {
+  if (cachedAppleToken && Date.now() < appleTokenExpiresAt) {
+    return cachedAppleToken;
+  }
+
+  try {
+    console.log('Fetching fresh Apple Music developer token...');
+    const homeRes = await fetch('https://music.apple.com', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+    });
+    const html = await homeRes.text();
+
+    const jsMatch = html.match(/\/assets\/index[^\"]+\.js/);
+    if (!jsMatch) throw new Error('Could not locate Apple Music JS bundle');
+
+    const jsRes = await fetch(`https://music.apple.com${jsMatch[0]}`);
+    const jsText = await jsRes.text();
+
+    const tokenMatch = jsText.match(
+      /eyJhbGciOiJFUzI1NiI[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/
+    );
+
+    if (tokenMatch) {
+      cachedAppleToken = tokenMatch[0];
+      appleTokenExpiresAt = Date.now() + 12 * 60 * 60 * 1000; // Cache 12 Hours
+      console.log('Successfully acquired live Apple Music Developer Token!');
+      return cachedAppleToken;
+    }
+  } catch (err) {
+    console.warn('Failed to scrape Apple Music token:', err.message);
+  }
+  return null;
+}
+
+// 3. Fetch Direct Stream URL from Tidal Manifest
 async function getTidalStreamUrl(trackId) {
   const token = await getAccessToken();
 
@@ -93,8 +126,11 @@ async function getTidalStreamUrl(trackId) {
   throw new Error('No audio URL found in Tidal manifest.');
 }
 
-// 3. Fetch Motion Video Artwork from Apple Music
+// 4. Extract Apple Music Motion Video Artwork
 async function getAppleMotionUrl(albumTitle, artistName) {
+  const token = await getAppleDeveloperToken();
+  if (!token) return null;
+
   try {
     const query = `${albumTitle} ${artistName}`;
     const searchUrl = `https://amp-api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(
@@ -103,42 +139,50 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     const searchRes = await fetch(searchUrl, {
       headers: {
-        'Authorization': `Bearer ${APPLE_MUSIC_TOKEN}`,
+        'Authorization': `Bearer ${token}`,
         'Origin': 'https://music.apple.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
       },
     });
 
     if (!searchRes.ok) return null;
 
     const searchData = await searchRes.json();
-    const album = searchData.results?.albums?.data?.[0];
+    const albumId = searchData.results?.albums?.data?.[0]?.id;
 
-    if (!album) return null;
+    if (!albumId) return null;
 
-    const albumDetailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${album.id}?include=editorialVideo`;
+    // Request detailed album metadata with editorialVideo included
+    const albumDetailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${albumId}?include=editorialVideo`;
     const detailRes = await fetch(albumDetailUrl, {
       headers: {
-        'Authorization': `Bearer ${APPLE_MUSIC_TOKEN}`,
+        'Authorization': `Bearer ${token}`,
         'Origin': 'https://music.apple.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
       },
     });
 
     if (!detailRes.ok) return null;
 
     const detailData = await detailRes.json();
-    const albumAttributes = detailData.data?.[0]?.attributes;
-    const editorialVideo = albumAttributes?.editorialVideo;
+    const albumObj = detailData.data?.[0];
+    const editorialVideo =
+      albumObj?.attributes?.editorialVideo ||
+      albumObj?.relationships?.editorialVideo?.data?.[0]?.attributes;
 
-    const motionVideoObj =
-      editorialVideo?.motionDetailSquare ||
-      editorialVideo?.motionSquare ||
-      editorialVideo?.motionDetailTall;
+    if (!editorialVideo) return null;
 
-    if (motionVideoObj) {
+    const motionObj =
+      editorialVideo.motionDetailSquare ||
+      editorialVideo.motionSquare ||
+      editorialVideo.motionDetailTall ||
+      editorialVideo.motionTall;
+
+    if (motionObj) {
       return (
-        motionVideoObj.video ||
-        motionVideoObj.response?.video ||
-        motionVideoObj.assets?.[0]?.url ||
+        motionObj.video ||
+        motionObj.assets?.[0]?.url ||
+        motionObj.response?.video ||
         null
       );
     }
@@ -150,19 +194,16 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
 // --- ENDPOINTS ---
 
-// Health Check
 app.get('/', (req, res) => {
-  res.json({ status: 'online', message: 'Tidal Audio & Motion Proxy is running!' });
+  res.json({ status: 'online', message: 'Tidal Audio & Apple Motion Proxy is running!' });
 });
 
-// Search Tracks Endpoint
+// Search Tracks
 app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query;
     if (!q) {
-      return res.status(400).json({
-        error: 'Search query "q" parameter is required.',
-      });
+      return res.status(400).json({ error: 'Search query "q" parameter is required.' });
     }
 
     const token = await getAccessToken();
@@ -202,7 +243,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Range Stream Proxy Endpoint
+// Audio Stream Proxy
 app.get('/api/stream', async (req, res) => {
   try {
     const { trackId } = req.query;
@@ -245,7 +286,7 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Apple Motion Video Endpoint
+// Apple Motion Artwork Endpoint
 app.get('/api/motion', async (req, res) => {
   try {
     const { album, artist } = req.query;
