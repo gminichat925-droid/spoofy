@@ -5,7 +5,6 @@ const { Readable } = require('stream');
 const app = express();
 app.use(cors());
 
-// Credentials loaded from Railway Environment Variables
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
@@ -15,13 +14,12 @@ const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
-// 1. Refresh Access Token automatically when expired
+// Refresh Access Token with explicit r_usr w_usr scopes
 async function getAccessToken() {
   if (!REFRESH_TOKEN) {
     throw new Error('TIDAL_REFRESH_TOKEN environment variable is missing on Railway.');
   }
 
-  // Return cached token if still valid
   if (cachedAccessToken && Date.now() < tokenExpiresAt - 60000) {
     return cachedAccessToken;
   }
@@ -37,6 +35,7 @@ async function getAccessToken() {
       client_id: CLIENT_ID,
       refresh_token: REFRESH_TOKEN,
       grant_type: 'refresh_token',
+      scope: 'r_usr w_usr', // CRITICAL: Preserves r_usr scope on token refresh
     }),
   });
 
@@ -51,7 +50,6 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
-// 2. Fetch Direct Stream URL from Tidal Manifest
 async function getTidalStreamUrl(trackId) {
   const token = await getAccessToken();
 
@@ -72,24 +70,21 @@ async function getTidalStreamUrl(trackId) {
   const data = await res.json();
 
   if (data.manifest) {
-    // Decode Base64 Manifest returned by Tidal
     const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
     const manifestJson = JSON.parse(decodedManifest);
 
     if (manifestJson.urls && manifestJson.urls.length > 0) {
-      return manifestJson.urls[0]; // Direct M4A audio stream URL from Tidal CDN
+      return manifestJson.urls[0];
     }
   }
 
   throw new Error('No audio URL found in Tidal manifest.');
 }
 
-// 3. Health Check
 app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'Tidal Audio Proxy is running!' });
 });
 
-// 4. Search Tracks Endpoint
 app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query;
@@ -130,7 +125,6 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// 5. Audio Range Stream Proxy
 app.get('/api/stream', async (req, res) => {
   try {
     const { trackId } = req.query;
