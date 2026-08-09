@@ -1,9 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const { spawn } = require('child_process');
+const { exec } = require('child_process');
+const util = require('util');
 const path = require('path');
 const fs = require('fs');
+const { Readable } = require('stream');
 
+const execPromise = util.promisify(exec);
 const app = express();
 app.use(cors());
 
@@ -20,61 +23,88 @@ app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'Music Stream Proxy is running!' });
 });
 
-// 2. Direct Audio Streaming Endpoint
-app.get('/api/stream', (req, res) => {
-  const { videoId } = req.query;
-  if (!videoId) return res.status(400).json({ error: 'videoId is required' });
-
-  const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const binary = fs.existsSync(YTDLP_PATH) ? YTDLP_PATH : 'yt-dlp';
-
-  // Set headers to force inline stream playback instead of downloading a file
-  res.setHeader('Content-Type', 'audio/mp4');
-  res.setHeader('Content-Disposition', 'inline; filename="stream.m4a"');
-
-  // yt-dlp arguments:
-  // -o - : Output audio bytes directly to stdout
-  const args = [
-    '--no-playlist',
-    '--force-ipv4',
-    '--js-runtimes',
-    'node',
-    '--extractor-args',
-    'youtube:player_client=ios,mweb,web',
-    '-f',
-    'ba[ext=m4a]/ba/b',
-    '-o',
-    '-',
-    targetUrl,
-  ];
+// Helper function to extract direct stream URL via yt-dlp
+async function getStreamUrl(targetUrl) {
+  const binary = fs.existsSync(YTDLP_PATH) ? `"${YTDLP_PATH}"` : 'yt-dlp';
+  const flags = `--no-playlist --force-ipv4 --js-runtimes node --extractor-args "youtube:player_client=ios,mweb,web" -g -f "ba[ext=m4a]/ba/b"`;
 
   if (fs.existsSync(COOKIES_PATH)) {
-    args.unshift('--cookies', COOKIES_PATH);
+    try {
+      const cookieCommand = `${binary} --cookies "${COOKIES_PATH}" ${flags} "${targetUrl}"`;
+      const { stdout } = await execPromise(cookieCommand);
+      if (stdout.trim()) return stdout.trim();
+    } catch (err) {
+      console.warn('Cookie extraction failed, falling back without cookies...', err.message);
+    }
   }
 
-  console.log(`Starting stream for videoId: ${videoId}`);
-  const ytdlpProcess = spawn(binary, args);
+  const noCookieCommand = `${binary} ${flags} "${targetUrl}"`;
+  const { stdout } = await execPromise(noCookieCommand);
+  return stdout.trim();
+}
 
-  // Pipe yt-dlp binary stream straight to Express response
-  ytdlpProcess.stdout.pipe(res);
+// 2. HTTP Range Proxy Endpoint
+app.get('/api/stream', async (req, res) => {
+  try {
+    const { videoId } = req.query;
+    if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
-  ytdlpProcess.stderr.on('data', (data) => {
-    // Log warnings/progress from yt-dlp
-    console.log(`yt-dlp: ${data.toString().trim()}`);
-  });
+    const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const directStreamUrl = await getStreamUrl(targetUrl);
 
-  ytdlpProcess.on('error', (err) => {
-    console.error('yt-dlp Spawn Error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to start stream process' });
+    if (!directStreamUrl) {
+      return res.status(404).json({ error: 'No stream URL returned from yt-dlp' });
     }
-  });
 
-  // Kill the yt-dlp process if the user closes or pauses the app
-  req.on('close', () => {
-    console.log(`Client disconnected from videoId: ${videoId}`);
-    ytdlpProcess.kill();
-  });
+    // Forward client's HTTP Range header (default to start if missing)
+    const clientRange = req.headers.range || 'bytes=0-';
+
+    const youtubeResponse = await fetch(directStreamUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Range': clientRange,
+      },
+    });
+
+    if (!youtubeResponse.ok && youtubeResponse.status !== 206) {
+      console.error(`YouTube CDN error status: ${youtubeResponse.status}`);
+      return res.status(youtubeResponse.status).json({ error: 'YouTube CDN request failed' });
+    }
+
+    // Pass HTTP status (206 Partial Content / 200 OK)
+    res.status(youtubeResponse.status);
+
+    // Forward required streaming headers to client
+    const headersToForward = [
+      'content-type',
+      'content-length',
+      'content-range',
+      'accept-ranges',
+    ];
+
+    headersToForward.forEach((headerName) => {
+      const headerVal = youtubeResponse.headers.get(headerName);
+      if (headerVal) {
+        res.setHeader(headerName, headerVal);
+      }
+    });
+
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    // Stream audio bytes straight to client
+    const audioStream = Readable.fromWeb(youtubeResponse.body);
+    audioStream.pipe(res);
+
+  } catch (error) {
+    console.error('Proxy Error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'Stream proxying failed',
+        details: error.message || String(error),
+      });
+    }
+  }
 });
 
 const PORT = process.env.PORT || 3000;
