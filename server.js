@@ -5,6 +5,7 @@ const { Readable } = require('stream');
 const app = express();
 app.use(cors());
 
+// Credentials loaded from Railway Environment Variables
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
@@ -14,7 +15,7 @@ const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
-// Refresh Access Token with explicit r_usr w_usr scopes
+// 1. Refresh Access Token automatically with r_usr w_usr scopes
 async function getAccessToken() {
   if (!REFRESH_TOKEN) {
     throw new Error('TIDAL_REFRESH_TOKEN environment variable is missing on Railway.');
@@ -35,7 +36,7 @@ async function getAccessToken() {
       client_id: CLIENT_ID,
       refresh_token: REFRESH_TOKEN,
       grant_type: 'refresh_token',
-      scope: 'r_usr w_usr', // CRITICAL: Preserves r_usr scope on token refresh
+      scope: 'r_usr w_usr',
     }),
   });
 
@@ -50,6 +51,7 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
+// 2. Fetch Direct Stream URL from Tidal Manifest
 async function getTidalStreamUrl(trackId) {
   const token = await getAccessToken();
 
@@ -85,15 +87,20 @@ app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'Tidal Audio Proxy is running!' });
 });
 
+// 3. Search Tracks Endpoint
 app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query;
-    if (!q) return res.status(400).json({ error: 'Search query "q" is required' });
+    if (!q) {
+      return res.status(400).json({
+        error: 'Search query "q" parameter is required. Example: /api/search?q=Blinding%20Lights',
+      });
+    }
 
     const token = await getAccessToken();
-    const searchUrl = `https://api.tidal.com/v1/search/tracks?query=${encodeURIComponent(
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(
       q
-    )}&limit=10&countryCode=US`;
+    )}&limit=10&types=TRACKS&countryCode=US`;
 
     const searchRes = await fetch(searchUrl, {
       headers: {
@@ -108,11 +115,15 @@ app.get('/api/search', async (req, res) => {
     }
 
     const searchData = await searchRes.json();
-    const tracks = (searchData.items || []).map((t) => ({
+
+    // Safely parse items from searchData.tracks.items OR searchData.items
+    const rawItems = searchData.tracks?.items || searchData.items || [];
+
+    const tracks = rawItems.map((t) => ({
       id: t.id,
       title: t.title,
-      artist: t.artist?.name,
-      album: t.album?.title,
+      artist: t.artist?.name || t.artists?.[0]?.name || 'Unknown Artist',
+      album: t.album?.title || 'Unknown Album',
       coverUrl: t.album?.cover
         ? `https://resources.tidal.com/images/${t.album.cover.replace(/-/g, '/')}/320x320.jpg`
         : null,
@@ -125,6 +136,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
+// 4. Audio Range Stream Proxy
 app.get('/api/stream', async (req, res) => {
   try {
     const { trackId } = req.query;
