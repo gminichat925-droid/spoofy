@@ -1,0 +1,9 @@
+{
+  "name": "music-stream-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "youtubei.js": "^17.2.0"
+  }
+}
