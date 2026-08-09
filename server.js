@@ -55,7 +55,8 @@ async function getAccessToken() {
 async function getTidalStreamUrl(trackId) {
   const token = await getAccessToken();
 
-  const url = `https://api.tidal.com/v1/tracks/${trackId}/playbackinfostreamurl?audioquality=HIGH&playbackmode=STREAM&assetpresentation=FULL`;
+  // FIX: Route updated to 'playbackinfopostpaywall'
+  const url = `https://api.tidal.com/v1/tracks/${trackId}/playbackinfopostpaywall?audioquality=HIGH&playbackmode=STREAM&assetpresentation=FULL`;
 
   const res = await fetch(url, {
     headers: {
@@ -73,10 +74,17 @@ async function getTidalStreamUrl(trackId) {
 
   if (data.manifest) {
     const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
-    const manifestJson = JSON.parse(decodedManifest);
 
-    if (manifestJson.urls && manifestJson.urls.length > 0) {
-      return manifestJson.urls[0];
+    try {
+      // Decode BTS JSON manifest for direct M4A URL
+      const manifestJson = JSON.parse(decodedManifest);
+      if (manifestJson.urls && manifestJson.urls.length > 0) {
+        return manifestJson.urls[0];
+      }
+    } catch (e) {
+      // Fallback: Extract URL from DASH XML manifest if returned
+      const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
+      if (urlMatch) return urlMatch[0];
     }
   }
 
@@ -93,7 +101,7 @@ app.get('/api/search', async (req, res) => {
     const { q } = req.query;
     if (!q) {
       return res.status(400).json({
-        error: 'Search query "q" parameter is required. Example: /api/search?q=Blinding%20Lights',
+        error: 'Search query "q" parameter is required.',
       });
     }
 
@@ -115,8 +123,6 @@ app.get('/api/search', async (req, res) => {
     }
 
     const searchData = await searchRes.json();
-
-    // Safely parse items from searchData.tracks.items OR searchData.items
     const rawItems = searchData.tracks?.items || searchData.items || [];
 
     const tracks = rawItems.map((t) => ({
