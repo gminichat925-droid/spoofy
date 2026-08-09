@@ -29,10 +29,11 @@ app.get('/api/stream', async (req, res) => {
     const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
     const binary = fs.existsSync(YTDLP_PATH) ? `"${YTDLP_PATH}"` : 'yt-dlp';
 
-    // Added flags:
-    // --js-runtimes node : Uses Node.js to solve YouTube's JS n-challenge
-    // --extractor-args "youtube:player_client=android,web" : Bypasses SABR restrictions
-    let flags = `--no-playlist --force-ipv4 --js-runtimes node --extractor-args "youtube:player_client=android,web" -g -f "ba/b"`;
+    // Flags:
+    // --js-runtimes node : Solves YouTube's JS n-challenge using Node.js
+    // --extractor-args "youtube:player_client=android,web" : Bypasses SABR experiment restrictions
+    // -f "140/ba[ext=m4a]/ba[acodec=mp4a]/ba" : Strictly prioritizes m4a/AAC format so iOS and Android native players can play the audio
+    let flags = `--no-playlist --force-ipv4 --js-runtimes node --extractor-args "youtube:player_client=android,web" -g -f "140/ba[ext=m4a]/ba[acodec=mp4a]/ba"`;
 
     let command = `${binary} ${flags} "${targetUrl}"`;
     if (fs.existsSync(COOKIES_PATH)) {
