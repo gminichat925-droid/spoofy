@@ -13,9 +13,11 @@ app.use(cors());
 const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 
-// 1. Create cookies.txt if environment variable is present
+// 1. Properly format and write cookies.txt from Railway environment variable
 if (process.env.YOUTUBE_COOKIES) {
-  fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES);
+  // Convert escaped literal '\n' strings into actual line breaks if needed
+  const formattedCookies = process.env.YOUTUBE_COOKIES.replace(/\\n/g, '\n');
+  fs.writeFileSync(COOKIES_PATH, formattedCookies);
   console.log('Successfully created cookies.txt');
 }
 
@@ -26,7 +28,9 @@ app.get('/', (req, res) => {
 // Helper function to extract direct stream URL via yt-dlp
 async function getStreamUrl(targetUrl) {
   const binary = fs.existsSync(YTDLP_PATH) ? `"${YTDLP_PATH}"` : 'yt-dlp';
-  const flags = `--no-playlist --force-ipv4 --js-runtimes node --extractor-args "youtube:player_client=ios,mweb,web" -g -f "ba[ext=m4a]/ba/b"`;
+  
+  // Use mweb, ios, tv, android clients (EXCLUDING 'web' which triggers bot checks on cloud IPs)
+  const flags = `--no-playlist --force-ipv4 --js-runtimes node --extractor-args "youtube:player_client=mweb,ios,tv,android" -g -f "ba[ext=m4a]/ba/b"`;
 
   if (fs.existsSync(COOKIES_PATH)) {
     try {
@@ -34,7 +38,7 @@ async function getStreamUrl(targetUrl) {
       const { stdout } = await execPromise(cookieCommand);
       if (stdout.trim()) return stdout.trim();
     } catch (err) {
-      console.warn('Cookie extraction failed, falling back without cookies...', err.message);
+      console.warn('Cookie extraction failed, attempting fallback without cookies...', err.message);
     }
   }
 
@@ -56,7 +60,7 @@ app.get('/api/stream', async (req, res) => {
       return res.status(404).json({ error: 'No stream URL returned from yt-dlp' });
     }
 
-    // Forward client's HTTP Range header (default to start if missing)
+    // Forward client Range header or default to full range
     const clientRange = req.headers.range || 'bytes=0-';
 
     const youtubeResponse = await fetch(directStreamUrl, {
@@ -72,10 +76,8 @@ app.get('/api/stream', async (req, res) => {
       return res.status(youtubeResponse.status).json({ error: 'YouTube CDN request failed' });
     }
 
-    // Pass HTTP status (206 Partial Content / 200 OK)
     res.status(youtubeResponse.status);
 
-    // Forward required streaming headers to client
     const headersToForward = [
       'content-type',
       'content-length',
@@ -92,7 +94,6 @@ app.get('/api/stream', async (req, res) => {
 
     res.setHeader('Accept-Ranges', 'bytes');
 
-    // Stream audio bytes straight to client
     const audioStream = Readable.fromWeb(youtubeResponse.body);
     audioStream.pipe(res);
 
