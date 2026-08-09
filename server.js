@@ -15,6 +15,9 @@ const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
+let cachedAppleToken = null;
+let appleTokenExpiresAt = 0;
+
 // 1. Refresh Tidal Access Token
 async function getAccessToken() {
   if (!REFRESH_TOKEN) {
@@ -88,31 +91,133 @@ async function getTidalStreamUrl(trackId) {
   throw new Error('No audio URL found in Tidal manifest.');
 }
 
-// 3. Extract Apple Music Motion Artwork (Token-Free Scraper)
-async function getAppleMotionUrl(albumTitle, artistName) {
-  try {
-    const searchQuery = `${albumTitle} ${artistName}`;
-    console.log(`[Apple Motion] Searching iTunes catalog for: "${searchQuery}"`);
+// 3. Dynamically Scrape Live Apple Music Developer Token
+async function getAppleDeveloperToken() {
+  if (cachedAppleToken && Date.now() < appleTokenExpiresAt) {
+    return cachedAppleToken;
+  }
 
-    // Step A: Find album on iTunes Search API (no auth required)
+  try {
+    console.log('[Apple Motion] Fetching live Apple Music developer token...');
+    const res = await fetch('https://music.apple.com/us/browse', {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+    });
+    const html = await res.text();
+
+    // Strategy A: Scrape from meta tag
+    const metaMatch = html.match(/name="apple-music-developer-token"\s+content="([^"]+)"/);
+    if (metaMatch && metaMatch[1]) {
+      cachedAppleToken = metaMatch[1];
+      appleTokenExpiresAt = Date.now() + 12 * 60 * 60 * 1000;
+      console.log('[Apple Motion] Token scraped from meta tag successfully!');
+      return cachedAppleToken;
+    }
+
+    // Strategy B: Scrape from main JS bundle
+    const jsMatch = html.match(/\/assets\/index[^\"]+\.js/);
+    if (jsMatch) {
+      const jsRes = await fetch(`https://music.apple.com${jsMatch[0]}`);
+      const jsText = await jsRes.text();
+      const tokenMatch = jsText.match(
+        /eyJhbGciOiJFUzI1NiI[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/
+      );
+      if (tokenMatch) {
+        cachedAppleToken = tokenMatch[0];
+        appleTokenExpiresAt = Date.now() + 12 * 60 * 60 * 1000;
+        console.log('[Apple Motion] Token scraped from JS bundle successfully!');
+        return cachedAppleToken;
+      }
+    }
+  } catch (err) {
+    console.warn('[Apple Motion] Failed to scrape Apple token:', err.message);
+  }
+  return null;
+}
+
+// 4. Extract Apple Motion Artwork (Dual-Engine: Amp API + Unescaped Web Scraper)
+async function getAppleMotionUrl(albumTitle, artistName) {
+  const searchQuery = `${albumTitle} ${artistName}`;
+  console.log(`[Apple Motion] Searching for: "${searchQuery}"`);
+
+  // ENGINE 1: Apple Catalog Amp API
+  const token = await getAppleDeveloperToken();
+  if (token) {
+    try {
+      const searchUrl = `https://amp-api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(
+        searchQuery
+      )}&types=albums&limit=1`;
+
+      const searchRes = await fetch(searchUrl, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Origin': 'https://music.apple.com',
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        },
+      });
+
+      if (searchRes.ok) {
+        const searchData = await searchRes.json();
+        const albumId = searchData.results?.albums?.data?.[0]?.id;
+
+        if (albumId) {
+          const detailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${albumId}?include=editorialVideo&platform=web`;
+          const detailRes = await fetch(detailUrl, {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Origin': 'https://music.apple.com',
+              'User-Agent':
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            },
+          });
+
+          if (detailRes.ok) {
+            const detailData = await detailRes.json();
+            const albumObj = detailData.data?.[0];
+            const editorialVideo =
+              albumObj?.attributes?.editorialVideo ||
+              albumObj?.relationships?.editorialVideo?.data?.[0]?.attributes;
+
+            if (editorialVideo) {
+              const motionObj =
+                editorialVideo.motionDetailSquare ||
+                editorialVideo.motionSquare ||
+                editorialVideo.motionDetailTall ||
+                editorialVideo.motionTall;
+
+              const videoUrl =
+                motionObj?.video ||
+                motionObj?.assets?.[0]?.url ||
+                motionObj?.response?.video;
+
+              if (videoUrl) {
+                console.log('[Apple Motion] Success via Amp API!');
+                return videoUrl;
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[Apple Motion] Engine 1 error:', err.message);
+    }
+  }
+
+  // ENGINE 2: Unescaped Deep HTML Web Scraper
+  try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
     )}&entity=album&limit=3`;
-
     const searchRes = await fetch(iTunesUrl);
     if (!searchRes.ok) return null;
 
     const searchData = await searchRes.json();
     const albumUrl = searchData.results?.[0]?.collectionViewUrl;
+    if (!albumUrl) return null;
 
-    if (!albumUrl) {
-      console.log('[Apple Motion] No matching album found on iTunes.');
-      return null;
-    }
-
-    console.log(`[Apple Motion] Found album page: ${albumUrl}`);
-
-    // Step B: Fetch public Apple Music album HTML page
     const pageRes = await fetch(albumUrl, {
       headers: {
         'User-Agent':
@@ -122,43 +227,29 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     if (!pageRes.ok) return null;
 
-    const html = await pageRes.text();
+    let html = await pageRes.text();
+    // Unescape JSON escaped slashes (\/ and \u002F)
+    html = html.replace(/\\\/|\\u002F/g, '/');
 
-    // Step C: Check serialized JSON state inside the webpage for editorialVideo
-    const scriptMatch = html.match(/<script[^>]*id="serialized-server-data"[^>]*>([\s\S]*?)<\/script>/i);
-    if (scriptMatch && scriptMatch[1]) {
-      try {
-        const serverData = JSON.parse(scriptMatch[1]);
-        const jsonStr = JSON.stringify(serverData);
+    // Scan for Apple CDN video URLs (.mp4 or .m3u8)
+    const videoMatches = html.match(
+      /https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*/gi
+    );
 
-        // Find video URLs inside serverData structure
-        const videoMatch = jsonStr.match(/https?:\/\/video-ssl\.itunes\.apple\.com\/[^\s"'\\]+\.(?:mp4|m3u8)[^\s"'\\]*/i);
-        if (videoMatch) {
-          console.log('[Apple Motion] Found motion video URL in server data!');
-          return videoMatch[0].replace(/\\/g, '');
-        }
-      } catch (e) {
-        // Ignore JSON parse error and fallback to regex scanning
-      }
+    if (videoMatches && videoMatches.length > 0) {
+      const squareVideo =
+        videoMatches.find(
+          (u) =>
+            u.includes('square') || u.includes('motion') || u.includes('editorial')
+        ) || videoMatches[0];
+
+      console.log('[Apple Motion] Success via Unescaped Scraper!');
+      return squareVideo;
     }
-
-    // Step D: Fallback regex scan directly on HTML
-    const directMatches = html.match(/https?:\/\/video-ssl\.itunes\.apple\.com\/[^\s"'\\]+\.(?:mp4|m3u8)[^\s"'\\]*/gi);
-
-    if (directMatches && directMatches.length > 0) {
-      // Prioritize square 1:1 motion video assets
-      const squareVideo = directMatches.find(
-        (url) => url.includes('square') || url.includes('1x1') || url.includes('1:1')
-      );
-      const selectedUrl = (squareVideo || directMatches[0]).replace(/\\/g, '');
-      console.log('[Apple Motion] Found motion video URL via direct HTML match!');
-      return selectedUrl;
-    }
-
-    console.log('[Apple Motion] Album exists on Apple Music but does not have motion artwork.');
   } catch (err) {
-    console.warn('[Apple Motion] Extraction error:', err.message);
+    console.warn('[Apple Motion] Engine 2 error:', err.message);
   }
+
   return null;
 }
 
