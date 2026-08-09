@@ -28,8 +28,9 @@ app.get('/api/stream', (req, res) => {
   const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const binary = fs.existsSync(YTDLP_PATH) ? YTDLP_PATH : 'yt-dlp';
 
-  // Set response headers for audio playback
-  res.setHeader('Content-Type', 'audio/m4a');
+  // Set headers to force inline stream playback instead of downloading a file
+  res.setHeader('Content-Type', 'audio/mp4');
+  res.setHeader('Content-Disposition', 'inline; filename="stream.m4a"');
 
   // yt-dlp arguments:
   // -o - : Output audio bytes directly to stdout
