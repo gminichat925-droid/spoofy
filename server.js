@@ -297,43 +297,47 @@ async function getAppleMotionUrl(albumTitle, artistName) {
   return null;
 }
 
-// 5. Fetch LRCLIB Lyrics (Dual-Engine Fallback)
-async function getLrclibLyrics(title, artist, album, duration) {
-  // A User-Agent identifying the app is strictly mandated by the LRCLIB API to prevent bans
+// 5. Fetch LRCLIB Lyrics (Prioritizing Word-by-Word)
+async function getLrclibLyrics(title, artist) {
   const USER_AGENT = 'SpoofyApp/1.0 (spoofy@example.com)';
 
   try {
-    // Attempt 1: Exact Metadata Match
-    const getUrl = new URL('https://lrclib.net/api/get');
-    getUrl.searchParams.append('track_name', title);
-    getUrl.searchParams.append('artist_name', artist);
-    if (album) getUrl.searchParams.append('album_name', album);
-    if (duration) getUrl.searchParams.append('duration', duration); // Optional: in seconds
-
-    console.log(`[LRCLIB] Exact match searching for: "${title}" by "${artist}"`);
-    let res = await fetch(getUrl.toString(), {
-      headers: { 'User-Agent': USER_AGENT },
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (res.ok) {
-      return await res.json();
-    }
-
-    // Attempt 2: Lenient Search Fallback (if exact API match fails)
-    console.log(`[LRCLIB] Exact match failed, falling back to search query...`);
     const searchUrl = new URL('https://lrclib.net/api/search');
     searchUrl.searchParams.append('q', `${title} ${artist}`);
 
-    res = await fetch(searchUrl.toString(), {
+    console.log(`[LRCLIB] Searching for lyrics: "${title} ${artist}"`);
+    const res = await fetch(searchUrl.toString(), {
       headers: { 'User-Agent': USER_AGENT },
       signal: AbortSignal.timeout(5000),
     });
 
     if (res.ok) {
-      const searchData = await res.json();
-      if (searchData && searchData.length > 0) {
-        return searchData[0]; // Returns the best fuzzy match
+      const results = await res.json();
+      if (results && results.length > 0) {
+        
+        // Regex to detect Enhanced LRC (word-by-word tags like <00:10.50>)
+        const enhancedLrcRegex = /<\d{2}:\d{2}\.\d{2,3}>/;
+
+        // PRIORITY 1: Find a result WITH word-by-word sync
+        const wordByWordMatch = results.find(
+          (r) => r.syncedLyrics && enhancedLrcRegex.test(r.syncedLyrics)
+        );
+
+        if (wordByWordMatch) {
+          console.log(`[LRCLIB] ✅ Found WORD-BY-WORD lyrics!`);
+          return { ...wordByWordMatch, isWordByWord: true };
+        }
+
+        // PRIORITY 2: Fallback to standard line-by-line sync
+        const lineByLineMatch = results.find((r) => r.syncedLyrics);
+        if (lineByLineMatch) {
+          console.log(`[LRCLIB] ⚠️ Found LINE-BY-LINE lyrics.`);
+          return { ...lineByLineMatch, isWordByWord: false };
+        }
+
+        // PRIORITY 3: Fallback to plain text
+        console.log(`[LRCLIB] ❌ Only plain lyrics found.`);
+        return { ...results[0], isWordByWord: false };
       }
     }
   } catch (err) {
@@ -475,20 +479,20 @@ app.get('/api/motion', async (req, res) => {
 // LRCLIB Lyrics Endpoint
 app.get('/api/lyrics', async (req, res) => {
   try {
-    const { title, artist, album, duration } = req.query;
+    const { title, artist } = req.query;
     
     if (!title || !artist) {
       return res.status(400).json({ error: 'Both title and artist query parameters are required.' });
     }
 
-    const lyricsData = await getLrclibLyrics(title, artist, album, duration);
+    const lyricsData = await getLrclibLyrics(title, artist);
 
     if (lyricsData) {
       res.json({
         found: true,
+        isWordByWord: lyricsData.isWordByWord, // Tells frontend if we have true karaoke
         plainLyrics: lyricsData.plainLyrics || null,
-        syncedLyrics: lyricsData.syncedLyrics || null, // Standard LRC (Line-by-line sync)
-        lyricsfile: lyricsData.lyricsfile || null,     // Next-Gen YAML (Word-by-word sync)
+        syncedLyrics: lyricsData.syncedLyrics || null,
       });
     } else {
       res.json({
