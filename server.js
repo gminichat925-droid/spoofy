@@ -102,7 +102,7 @@ async function getAppleDeveloperToken() {
     const res = await fetch('https://music.apple.com/us/browse', {
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
       },
     });
     const html = await res.text();
@@ -137,12 +137,15 @@ async function getAppleDeveloperToken() {
   return null;
 }
 
-// 4. Extract Apple Motion Artwork (Prioritizing Tall/Portrait Assets)
+// 4. Extract Apple Motion Artwork (Forcing Mobile Headers for Tall/Portrait Assets)
 async function getAppleMotionUrl(albumTitle, artistName) {
   const searchQuery = `${albumTitle} ${artistName}`;
   console.log(`[Apple Motion] Searching for tall artwork: "${searchQuery}"`);
 
-  // ENGINE 1: Apple Catalog Amp API
+  const IPHONE_USER_AGENT =
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
+
+  // ENGINE 1: Apple Catalog Amp API (Forced platform=iphone)
   const token = await getAppleDeveloperToken();
   if (token) {
     try {
@@ -154,8 +157,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
         headers: {
           'Authorization': `Bearer ${token}`,
           'Origin': 'https://music.apple.com',
-          'User-Agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+          'User-Agent': IPHONE_USER_AGENT,
         },
       });
 
@@ -164,13 +166,13 @@ async function getAppleMotionUrl(albumTitle, artistName) {
         const albumId = searchData.results?.albums?.data?.[0]?.id;
 
         if (albumId) {
-          const detailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${albumId}?include=editorialVideo&platform=web`;
+          // platform=iphone forces Apple to send motionDetailTall payloads
+          const detailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${albumId}?include=editorialVideo&platform=iphone`;
           const detailRes = await fetch(detailUrl, {
             headers: {
               'Authorization': `Bearer ${token}`,
               'Origin': 'https://music.apple.com',
-              'User-Agent':
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+              'User-Agent': IPHONE_USER_AGENT,
             },
           });
 
@@ -182,12 +184,11 @@ async function getAppleMotionUrl(albumTitle, artistName) {
               albumObj?.relationships?.editorialVideo?.data?.[0]?.attributes;
 
             if (editorialVideo) {
-              // PRIORITY: Check for tall/portrait assets before square
+              // Extract tall/portrait asset specifically
               const motionObj =
                 editorialVideo.motionDetailTall ||
                 editorialVideo.motionTall ||
-                editorialVideo.motionDetailSquare ||
-                editorialVideo.motionSquare;
+                editorialVideo.motionDetailSquare;
 
               const videoUrl =
                 motionObj?.video ||
@@ -195,7 +196,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
                 motionObj?.response?.video;
 
               if (videoUrl) {
-                console.log('[Apple Motion] Found video via Amp API!');
+                console.log('[Apple Motion] Successfully found TALL motion artwork!');
                 return videoUrl;
               }
             }
@@ -207,7 +208,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // ENGINE 2: Unescaped Deep HTML Web Scraper (Fallback)
+  // ENGINE 2: Unescaped Deep HTML Web Scraper (Fallback with iPhone headers)
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
@@ -220,10 +221,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     if (!albumUrl) return null;
 
     const pageRes = await fetch(albumUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
+      headers: { 'User-Agent': IPHONE_USER_AGENT },
     });
 
     if (!pageRes.ok) return null;
@@ -238,17 +236,17 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     );
 
     if (videoMatches && videoMatches.length > 0) {
-      // PRIORITY: Find URLs containing 'tall' or 'portrait' keywords first
       const tallVideo =
         videoMatches.find(
           (u) =>
             u.includes('tall') ||
             u.includes('portrait') ||
             u.includes('3x4') ||
-            u.includes('9x16')
+            u.includes('9x16') ||
+            u.includes('P')
         ) || videoMatches[0];
 
-      console.log('[Apple Motion] Found video via Unescaped Scraper!');
+      console.log('[Apple Motion] Found tall video via Unescaped Scraper!');
       return tallVideo;
     }
   } catch (err) {
