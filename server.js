@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
-const { Vibrant } = require('node-vibrant/node'); // <-- Fixed import for Node.js environment
+const { Vibrant } = require('node-vibrant/node'); 
 
 const app = express();
 app.use(cors());
@@ -186,7 +186,7 @@ function extractTallUrlFromRawString(str) {
   return null;
 }
 
-// 4. Extract Apple Motion Artwork (Strict Tall/Portrait Extraction)
+// 4. Extract Apple Motion Artwork
 async function getAppleMotionUrl(albumTitle, artistName) {
   const searchQuery = `${albumTitle} ${artistName}`;
   console.log(`[Apple Motion] Searching strictly for tall artwork: "${searchQuery}"`);
@@ -243,7 +243,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // ENGINE 2: Web Scraper Fallback (Isolated String Slicing)
+  // ENGINE 2: Web Scraper Fallback
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
@@ -297,10 +297,56 @@ async function getAppleMotionUrl(albumTitle, artistName) {
   return null;
 }
 
+// 5. Fetch LRCLIB Lyrics (Dual-Engine Fallback)
+async function getLrclibLyrics(title, artist, album, duration) {
+  // A User-Agent identifying the app is strictly mandated by the LRCLIB API to prevent bans
+  const USER_AGENT = 'SpoofyApp/1.0 (spoofy@example.com)';
+
+  try {
+    // Attempt 1: Exact Metadata Match
+    const getUrl = new URL('https://lrclib.net/api/get');
+    getUrl.searchParams.append('track_name', title);
+    getUrl.searchParams.append('artist_name', artist);
+    if (album) getUrl.searchParams.append('album_name', album);
+    if (duration) getUrl.searchParams.append('duration', duration); // Optional: in seconds
+
+    console.log(`[LRCLIB] Exact match searching for: "${title}" by "${artist}"`);
+    let res = await fetch(getUrl.toString(), {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      return await res.json();
+    }
+
+    // Attempt 2: Lenient Search Fallback (if exact API match fails)
+    console.log(`[LRCLIB] Exact match failed, falling back to search query...`);
+    const searchUrl = new URL('https://lrclib.net/api/search');
+    searchUrl.searchParams.append('q', `${title} ${artist}`);
+
+    res = await fetch(searchUrl.toString(), {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      const searchData = await res.json();
+      if (searchData && searchData.length > 0) {
+        return searchData[0]; // Returns the best fuzzy match
+      }
+    }
+  } catch (err) {
+    console.warn(`[LRCLIB] Lyrics fetch error/timeout: ${err.message}`);
+  }
+
+  return null;
+}
+
 // --- ENDPOINTS ---
 
 app.get('/', (req, res) => {
-  res.json({ status: 'online', message: 'Tidal Audio & Apple Motion Proxy is running!' });
+  res.json({ status: 'online', message: 'Tidal Audio, Apple Motion & LRCLIB Proxy is running!' });
 });
 
 // Search Tracks
@@ -421,6 +467,35 @@ app.get('/api/motion', async (req, res) => {
       motionUrl: motionUrl || null,
       themeColor: themeColor,
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// LRCLIB Lyrics Endpoint
+app.get('/api/lyrics', async (req, res) => {
+  try {
+    const { title, artist, album, duration } = req.query;
+    
+    if (!title || !artist) {
+      return res.status(400).json({ error: 'Both title and artist query parameters are required.' });
+    }
+
+    const lyricsData = await getLrclibLyrics(title, artist, album, duration);
+
+    if (lyricsData) {
+      res.json({
+        found: true,
+        plainLyrics: lyricsData.plainLyrics || null,
+        syncedLyrics: lyricsData.syncedLyrics || null, // Standard LRC (Line-by-line sync)
+        lyricsfile: lyricsData.lyricsfile || null,     // Next-Gen YAML (Word-by-word sync)
+      });
+    } else {
+      res.json({
+        found: false,
+        message: 'No lyrics found for this track.',
+      });
+    }
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
