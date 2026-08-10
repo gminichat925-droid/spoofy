@@ -107,7 +107,6 @@ async function getAppleDeveloperToken() {
     });
     const html = await res.text();
 
-    // Strategy A: Scrape from meta tag
     const metaMatch = html.match(/name="apple-music-developer-token"\s+content="([^"]+)"/);
     if (metaMatch && metaMatch[1]) {
       cachedAppleToken = metaMatch[1];
@@ -116,7 +115,6 @@ async function getAppleDeveloperToken() {
       return cachedAppleToken;
     }
 
-    // Strategy B: Scrape from main JS bundle
     const jsMatch = html.match(/\/assets\/index[^\"]+\.js/);
     if (jsMatch) {
       const jsRes = await fetch(`https://music.apple.com${jsMatch[0]}`);
@@ -137,7 +135,34 @@ async function getAppleDeveloperToken() {
   return null;
 }
 
-// 4. Extract Apple Motion Artwork (Forcing Mobile Headers for Tall/Portrait Assets)
+// Helper: Deep recursive search for tall motion artwork in JSON payloads
+function findTallVideoInJson(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+
+  // Explicit target keys for tall/portrait artwork
+  const tallKeys = ['motionDetailTall', 'motionTall', 'motionDetail3x4', 'motionDetail9x16'];
+  for (const key of tallKeys) {
+    if (obj[key]) {
+      const videoUrl =
+        obj[key].video ||
+        obj[key].assets?.[0]?.url ||
+        obj[key].response?.video;
+      if (videoUrl) return videoUrl;
+    }
+  }
+
+  // Recurse child properties
+  for (const key of Object.keys(obj)) {
+    if (typeof obj[key] === 'object') {
+      const result = findTallVideoInJson(obj[key]);
+      if (result) return result;
+    }
+  }
+
+  return null;
+}
+
+// 4. Extract Apple Motion Artwork (Targeting Tall/Portrait Assets)
 async function getAppleMotionUrl(albumTitle, artistName) {
   const searchQuery = `${albumTitle} ${artistName}`;
   console.log(`[Apple Motion] Searching for tall artwork: "${searchQuery}"`);
@@ -145,7 +170,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
   const IPHONE_USER_AGENT =
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
 
-  // ENGINE 1: Apple Catalog Amp API (Forced platform=iphone)
+  // ENGINE 1: Apple Catalog Amp API
   const token = await getAppleDeveloperToken();
   if (token) {
     try {
@@ -158,6 +183,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
           'Authorization': `Bearer ${token}`,
           'Origin': 'https://music.apple.com',
           'User-Agent': IPHONE_USER_AGENT,
+          'Accept-Language': 'en-US',
         },
       });
 
@@ -166,39 +192,23 @@ async function getAppleMotionUrl(albumTitle, artistName) {
         const albumId = searchData.results?.albums?.data?.[0]?.id;
 
         if (albumId) {
-          // platform=iphone forces Apple to send motionDetailTall payloads
-          const detailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${albumId}?include=editorialVideo&platform=iphone`;
+          // Pass hyphenated 'editorial-video' parameter
+          const detailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${albumId}?include=editorial-video,editorialVideo&platform=iphone`;
           const detailRes = await fetch(detailUrl, {
             headers: {
               'Authorization': `Bearer ${token}`,
               'Origin': 'https://music.apple.com',
               'User-Agent': IPHONE_USER_AGENT,
+              'Accept-Language': 'en-US',
             },
           });
 
           if (detailRes.ok) {
             const detailData = await detailRes.json();
-            const albumObj = detailData.data?.[0];
-            const editorialVideo =
-              albumObj?.attributes?.editorialVideo ||
-              albumObj?.relationships?.editorialVideo?.data?.[0]?.attributes;
-
-            if (editorialVideo) {
-              // Extract tall/portrait asset specifically
-              const motionObj =
-                editorialVideo.motionDetailTall ||
-                editorialVideo.motionTall ||
-                editorialVideo.motionDetailSquare;
-
-              const videoUrl =
-                motionObj?.video ||
-                motionObj?.assets?.[0]?.url ||
-                motionObj?.response?.video;
-
-              if (videoUrl) {
-                console.log('[Apple Motion] Successfully found TALL motion artwork!');
-                return videoUrl;
-              }
+            const tallUrl = findTallVideoInJson(detailData);
+            if (tallUrl) {
+              console.log('[Apple Motion] Found TALL video via Amp API deep search!');
+              return tallUrl;
             }
           }
         }
@@ -208,7 +218,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // ENGINE 2: Unescaped Deep HTML Web Scraper (Fallback with iPhone headers)
+  // ENGINE 2: Web Scraper Fallback (Targeting motionDetailTall)
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
@@ -227,27 +237,16 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     if (!pageRes.ok) return null;
 
     let html = await pageRes.text();
-    // Unescape JSON escaped slashes (\/ and \u002F)
     html = html.replace(/\\\/|\\u002F/g, '/');
 
-    // Scan for Apple CDN video URLs (.mp4 or .m3u8)
-    const videoMatches = html.match(
-      /https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*/gi
-    );
+    // Regex scan specifically for motionDetailTall block
+    const tallBlockMatch =
+      html.match(/"motionDetailTall"[\s\S]{1,500}?(https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)/i) ||
+      html.match(/"motionTall"[\s\S]{1,500}?(https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)/i);
 
-    if (videoMatches && videoMatches.length > 0) {
-      const tallVideo =
-        videoMatches.find(
-          (u) =>
-            u.includes('tall') ||
-            u.includes('portrait') ||
-            u.includes('3x4') ||
-            u.includes('9x16') ||
-            u.includes('P')
-        ) || videoMatches[0];
-
-      console.log('[Apple Motion] Found tall video via Unescaped Scraper!');
-      return tallVideo;
+    if (tallBlockMatch && tallBlockMatch[1]) {
+      console.log('[Apple Motion] Found TALL video via HTML regex block match!');
+      return tallBlockMatch[1];
     }
   } catch (err) {
     console.warn('[Apple Motion] Engine 2 error:', err.message);
