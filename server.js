@@ -293,24 +293,42 @@ async function getSpotifyToken() {
   }
 
   try {
-    const res = await fetch('https://open.spotify.com/get_access_token?reason=transport&productType=web_player', {
+    // Ensure the cookie is formatted correctly even if pasted with/without the sp_dc= prefix
+    const cleanCookie = SPOTIFY_SP_DC.replace('sp_dc=', '').trim();
+    
+    // Updated Method: Scrape token directly from the Web Player HTML payload
+    const res = await fetch('https://open.spotify.com/', {
       headers: {
-        'Cookie': `sp_dc=${SPOTIFY_SP_DC}`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'Cookie': `sp_dc=${cleanCookie}`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
       },
       signal: AbortSignal.timeout(5000),
     });
 
-    const data = await res.json();
-    if (data.isAnonymous) {
-      console.warn('[Spotify] sp_dc cookie is invalid or expired. Token returned anonymous.');
+    const html = await res.text();
+
+    // Spotify embeds the session JSON deep inside a script tag in the HTML body
+    const tokenMatch = html.match(/"accessToken":"([^"]+)"/);
+    const expiryMatch = html.match(/"accessTokenExpirationTimestampMs":(\d+)/);
+    const isAnonymousMatch = html.match(/"isAnonymous":\s*(true|false)/);
+
+    if (tokenMatch && tokenMatch[1]) {
+      const isAnon = isAnonymousMatch && isAnonymousMatch[1] === 'true';
+      if (isAnon) {
+        console.warn('[Spotify] sp_dc cookie is invalid or expired. Token returned anonymous.');
+        return null;
+      }
+
+      cachedSpotifyToken = tokenMatch[1];
+      // Default to a 50-minute expiration if exact timestamp parsing fails
+      spotifyTokenExpiresAt = expiryMatch ? parseInt(expiryMatch[1], 10) - 60000 : Date.now() + 3000000; 
+      
+      console.log('[Spotify] Successfully scraped authenticated Web Player token.');
+      return cachedSpotifyToken;
+    } else {
+      console.warn('[Spotify] Failed to scrape token from HTML. The page structure might have changed.');
       return null;
     }
-
-    cachedSpotifyToken = data.accessToken;
-    spotifyTokenExpiresAt = data.accessTokenExpirationTimestampMs - 60000;
-    console.log('[Spotify] Successfully generated authenticated Web Player token.');
-    return cachedSpotifyToken;
   } catch (e) {
     console.warn('[Spotify] Failed to get token:', e.message);
     return null;
