@@ -135,23 +135,16 @@ async function getAppleDeveloperToken() {
   return null;
 }
 
-// Helper: Deep recursive search for tall motion artwork in JSON payloads
+// Recursive function to search JSON exclusively for motionDetailTall
 function findTallVideoInJson(obj) {
   if (!obj || typeof obj !== 'object') return null;
 
-  // Explicit target keys for tall/portrait artwork
-  const tallKeys = ['motionDetailTall', 'motionTall', 'motionDetail3x4', 'motionDetail9x16'];
-  for (const key of tallKeys) {
-    if (obj[key]) {
-      const videoUrl =
-        obj[key].video ||
-        obj[key].assets?.[0]?.url ||
-        obj[key].response?.video;
-      if (videoUrl) return videoUrl;
-    }
+  if (obj.motionDetailTall || obj.motionTall) {
+    const target = obj.motionDetailTall || obj.motionTall;
+    const videoUrl = target?.video || target?.assets?.[0]?.url || target?.response?.video;
+    if (videoUrl) return videoUrl;
   }
 
-  // Recurse child properties
   for (const key of Object.keys(obj)) {
     if (typeof obj[key] === 'object') {
       const result = findTallVideoInJson(obj[key]);
@@ -192,7 +185,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
         const albumId = searchData.results?.albums?.data?.[0]?.id;
 
         if (albumId) {
-          // Pass hyphenated 'editorial-video' parameter
           const detailUrl = `https://amp-api.music.apple.com/v1/catalog/us/albums/${albumId}?include=editorial-video,editorialVideo&platform=iphone`;
           const detailRes = await fetch(detailUrl, {
             headers: {
@@ -218,7 +210,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // ENGINE 2: Web Scraper Fallback (Targeting motionDetailTall)
+  // ENGINE 2: Web Scraper Fallback (Parsing HTML JSON blocks for motionDetailTall)
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
@@ -236,17 +228,31 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     if (!pageRes.ok) return null;
 
-    let html = await pageRes.text();
-    html = html.replace(/\\\/|\\u002F/g, '/');
+    const html = await pageRes.text();
 
-    // Regex scan specifically for motionDetailTall block
-    const tallBlockMatch =
-      html.match(/"motionDetailTall"[\s\S]{1,500}?(https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)/i) ||
-      html.match(/"motionTall"[\s\S]{1,500}?(https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)/i);
-
-    if (tallBlockMatch && tallBlockMatch[1]) {
-      console.log('[Apple Motion] Found TALL video via HTML regex block match!');
-      return tallBlockMatch[1];
+    // Extract serialized JSON from webpage scripts
+    const scriptMatches = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
+    for (const scriptTag of scriptMatches) {
+      if (scriptTag.includes('motionDetailTall') || scriptTag.includes('motionTall')) {
+        const cleanScript = scriptTag.replace(/<[^>]+>/g, '').replace(/\\\/|\\u002F/g, '/');
+        try {
+          const json = JSON.parse(cleanScript);
+          const tallUrl = findTallVideoInJson(json);
+          if (tallUrl) {
+            console.log('[Apple Motion] Found TALL video via Webpage Script JSON!');
+            return tallUrl;
+          }
+        } catch (e) {
+          // Regex fallback if script tag contains JavaScript assignments instead of raw JSON
+          const regexMatch = cleanScript.match(
+            /"motionDetailTall"[\s\S]{1,300}?"video"\s*:\s*"(https?:\/\/[^"]+)"/i
+          );
+          if (regexMatch && regexMatch[1]) {
+            console.log('[Apple Motion] Found TALL video via Regex Script match!');
+            return regexMatch[1];
+          }
+        }
+      }
     }
   } catch (err) {
     console.warn('[Apple Motion] Engine 2 error:', err.message);
