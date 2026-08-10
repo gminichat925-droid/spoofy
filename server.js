@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
+const Vibrant = require('node-vibrant'); // <-- Added for dynamic color extraction
 
 const app = express();
 app.use(cors());
@@ -391,19 +392,37 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Apple Motion Artwork Endpoint
+// Apple Motion & Dynamic Color Extraction Endpoint
 app.get('/api/motion', async (req, res) => {
   try {
-    const { album, artist } = req.query;
+    const { album, artist, coverUrl } = req.query;
     if (!album || !artist) {
       return res.status(400).json({ error: 'Both album and artist query parameters are required.' });
     }
 
+    // 1. Fetch Apple Motion URL
     const motionUrl = await getAppleMotionUrl(album, artist);
+
+    // 2. Dynamically Extract Theme Color from the Artwork
+    let themeColor = '#2A2E3D'; // Default slate fallback
+    if (coverUrl) {
+      try {
+        const palette = await Vibrant.from(coverUrl).getPalette();
+        // Prioritize darker, muted colors to ensure white text remains readable
+        themeColor = 
+          palette.DarkMuted?.hex || 
+          palette.DarkVibrant?.hex || 
+          palette.Muted?.hex || 
+          themeColor;
+      } catch (colorErr) {
+        console.warn('[Color] Failed to extract color from URL:', colorErr.message);
+      }
+    }
 
     res.json({
       hasMotion: !!motionUrl,
       motionUrl: motionUrl || null,
+      themeColor: themeColor, // Send the extracted hex color back to Expo
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
