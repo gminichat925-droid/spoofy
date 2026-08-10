@@ -135,7 +135,7 @@ async function getAppleDeveloperToken() {
   return null;
 }
 
-// Recursive function to search JSON exclusively for motionDetailTall
+// Helper A: Recursive JSON traversal EXCLUSIVELY for motionDetailTall (skips square keys)
 function findTallVideoInJson(obj) {
   if (!obj || typeof obj !== 'object') return null;
 
@@ -146,7 +146,10 @@ function findTallVideoInJson(obj) {
   }
 
   for (const key of Object.keys(obj)) {
-    if (typeof obj[key] === 'object') {
+    // CRITICAL: Skip square keys so we never accidentally fall back to square
+    if (key === 'motionDetailSquare' || key === 'motionSquare') continue;
+
+    if (typeof obj[key] === 'object' && obj[key] !== null) {
       const result = findTallVideoInJson(obj[key]);
       if (result) return result;
     }
@@ -155,10 +158,35 @@ function findTallVideoInJson(obj) {
   return null;
 }
 
-// 4. Extract Apple Motion Artwork (Targeting Tall/Portrait Assets)
+// Helper B: Isolated text slicing specifically around motionDetailTall
+function extractTallUrlFromRawString(str) {
+  if (!str) return null;
+
+  const tallIdx = str.indexOf('"motionDetailTall"');
+  const tallShortIdx = str.indexOf('"motionTall"');
+
+  const targetIdx = tallIdx !== -1 ? tallIdx : tallShortIdx;
+  if (targetIdx === -1) return null;
+
+  // Slice a window of 800 characters starting directly at motionDetailTall
+  const snippet = str.slice(targetIdx, targetIdx + 800);
+
+  // If motionDetailSquare appears inside the snippet window, cut off before it
+  const squareInSnippetIdx = snippet.indexOf('"motionDetailSquare"');
+  const safeSnippet = squareInSnippetIdx !== -1 ? snippet.slice(0, squareInSnippetIdx) : snippet;
+
+  const urlMatch = safeSnippet.match(/https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*/i);
+  if (urlMatch) {
+    return urlMatch[0].replace(/\\\/|\\u002F/g, '/');
+  }
+
+  return null;
+}
+
+// 4. Extract Apple Motion Artwork (Strict Tall/Portrait Extraction)
 async function getAppleMotionUrl(albumTitle, artistName) {
   const searchQuery = `${albumTitle} ${artistName}`;
-  console.log(`[Apple Motion] Searching for tall artwork: "${searchQuery}"`);
+  console.log(`[Apple Motion] Searching strictly for tall artwork: "${searchQuery}"`);
 
   const IPHONE_USER_AGENT =
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
@@ -199,7 +227,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
             const detailData = await detailRes.json();
             const tallUrl = findTallVideoInJson(detailData);
             if (tallUrl) {
-              console.log('[Apple Motion] Found TALL video via Amp API deep search!');
+              console.log('[Apple Motion] Found TALL video via Amp API!');
               return tallUrl;
             }
           }
@@ -210,7 +238,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // ENGINE 2: Web Scraper Fallback (Parsing HTML JSON blocks for motionDetailTall)
+  // ENGINE 2: Web Scraper Fallback (Isolated String Slicing)
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
@@ -230,7 +258,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     const html = await pageRes.text();
 
-    // Extract serialized JSON from webpage scripts
+    // 1. Try parsing JSON script blocks safely
     const scriptMatches = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
     for (const scriptTag of scriptMatches) {
       if (scriptTag.includes('motionDetailTall') || scriptTag.includes('motionTall')) {
@@ -243,16 +271,21 @@ async function getAppleMotionUrl(albumTitle, artistName) {
             return tallUrl;
           }
         } catch (e) {
-          // Regex fallback if script tag contains JavaScript assignments instead of raw JSON
-          const regexMatch = cleanScript.match(
-            /"motionDetailTall"[\s\S]{1,300}?"video"\s*:\s*"(https?:\/\/[^"]+)"/i
-          );
-          if (regexMatch && regexMatch[1]) {
-            console.log('[Apple Motion] Found TALL video via Regex Script match!');
-            return regexMatch[1];
+          // 2. Isolated string slicing if script tag is raw JS
+          const slicedUrl = extractTallUrlFromRawString(cleanScript);
+          if (slicedUrl) {
+            console.log('[Apple Motion] Found TALL video via Isolated String Slicing!');
+            return slicedUrl;
           }
         }
       }
+    }
+
+    // 3. Fallback isolated string slice directly on HTML
+    const htmlSlicedUrl = extractTallUrlFromRawString(html);
+    if (htmlSlicedUrl) {
+      console.log('[Apple Motion] Found TALL video via HTML Isolated Slice!');
+      return htmlSlicedUrl;
     }
   } catch (err) {
     console.warn('[Apple Motion] Engine 2 error:', err.message);
