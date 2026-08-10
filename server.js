@@ -98,6 +98,36 @@ async function getTidalStreamUrl(trackId) {
   throw new Error('No audio URL found in Tidal manifest.');
 }
 
+// 2.5 Helper to Search Tidal by Title and Artist
+async function searchTidalForTrack(title, artist) {
+  try {
+    const token = await getAccessToken();
+    const query = `${title} ${artist}`;
+    console.log(`[Tidal] Searching for track: "${query}"`);
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(query)}&limit=5&types=TRACKS&countryCode=US`;
+
+    const searchRes = await fetch(searchUrl, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'x-tidal-token': CLIENT_ID,
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (searchRes.ok) {
+      const searchData = await searchRes.json();
+      const rawItems = searchData.tracks?.items || searchData.items || [];
+      if (rawItems.length > 0) {
+        console.log(`[Tidal] Found match! Tidal Track ID: ${rawItems[0].id}`);
+        return rawItems[0].id;
+      }
+    }
+  } catch (error) {
+    console.warn(`[Tidal] Search error: ${error.message}`);
+  }
+  return null;
+}
+
 // 3. Dynamically Scrape Live Apple Music Developer Token
 async function getAppleDeveloperToken() {
   if (cachedAppleToken && Date.now() < appleTokenExpiresAt) {
@@ -281,7 +311,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
   return null;
 }
 
-// 5. Spotify internal Lyrics Engine (Musixmatch Word-by-Word)
 // 5. Spotify internal Lyrics Engine (Musixmatch Word-by-Word)
 async function getSpotifyToken() {
   if (!SPOTIFY_SP_DC) {
@@ -534,8 +563,19 @@ app.get('/api/search', async (req, res) => {
 // Audio Stream Proxy
 app.get('/api/stream', async (req, res) => {
   try {
-    const { trackId } = req.query;
-    if (!trackId) return res.status(400).json({ error: 'trackId is required' });
+    let { trackId, title, artist } = req.query;
+    
+    if (!trackId && (!title || !artist)) {
+      return res.status(400).json({ error: 'trackId OR (title and artist) is required' });
+    }
+
+    // Resolve Tidal trackId using title and artist from Spotify
+    if (!trackId) {
+      trackId = await searchTidalForTrack(title, artist);
+      if (!trackId) {
+        return res.status(404).json({ error: 'Track not found on Tidal' });
+      }
+    }
 
     const directStreamUrl = await getTidalStreamUrl(trackId);
     const clientRange = req.headers.range || 'bytes=0-';
