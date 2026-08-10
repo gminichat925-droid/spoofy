@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
-const Vibrant = require('node-vibrant'); // <-- Added for dynamic color extraction
+const { Vibrant } = require('node-vibrant/node'); // <-- Fixed import for Node.js environment
 
 const app = express();
 app.use(cors());
@@ -42,7 +42,7 @@ async function getAccessToken() {
       grant_type: 'refresh_token',
       scope: 'r_usr w_usr',
     }),
-    signal: AbortSignal.timeout(5000), // 5-second timeout
+    signal: AbortSignal.timeout(5000),
   });
 
   if (!res.ok) {
@@ -107,7 +107,7 @@ async function getAppleDeveloperToken() {
         'User-Agent':
           'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
       },
-      signal: AbortSignal.timeout(5000), // Prevent infinite hangs
+      signal: AbortSignal.timeout(5000),
     });
     
     const html = await res.text();
@@ -139,7 +139,7 @@ async function getAppleDeveloperToken() {
   } catch (err) {
     console.warn(`[Apple Motion] Failed to scrape Apple token: ${err.message}`);
   }
-  return null; // Will fallback to Engine 2 if token fetch fails
+  return null;
 }
 
 // Helper A: Recursive JSON traversal EXCLUSIVELY for motionDetailTall (skips square keys)
@@ -257,7 +257,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     const pageRes = await fetch(albumUrl, {
       headers: { 'User-Agent': IPHONE_USER_AGENT },
-      signal: AbortSignal.timeout(6000), // Slightly longer for full HTML doc
+      signal: AbortSignal.timeout(6000),
     });
 
     if (!pageRes.ok) return null;
@@ -400,15 +400,12 @@ app.get('/api/motion', async (req, res) => {
       return res.status(400).json({ error: 'Both album and artist query parameters are required.' });
     }
 
-    // 1. Fetch Apple Motion URL
     const motionUrl = await getAppleMotionUrl(album, artist);
 
-    // 2. Dynamically Extract Theme Color from the Artwork
-    let themeColor = '#2A2E3D'; // Default slate fallback
+    let themeColor = '#2A2E3D';
     if (coverUrl) {
       try {
         const palette = await Vibrant.from(coverUrl).getPalette();
-        // Prioritize darker, muted colors to ensure white text remains readable
         themeColor = 
           palette.DarkMuted?.hex || 
           palette.DarkVibrant?.hex || 
@@ -422,7 +419,7 @@ app.get('/api/motion', async (req, res) => {
     res.json({
       hasMotion: !!motionUrl,
       motionUrl: motionUrl || null,
-      themeColor: themeColor, // Send the extracted hex color back to Expo
+      themeColor: themeColor,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
