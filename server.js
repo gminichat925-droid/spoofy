@@ -10,7 +10,7 @@ app.use(cors());
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
-const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC; // New Spotify Cookie
+const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC;
 
 const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
@@ -19,6 +19,7 @@ let tokenExpiresAt = 0;
 
 let cachedAppleToken = null;
 let appleTokenExpiresAt = 0;
+let lastAppleTokenAttempt = 0; // Cooldown tracker to prevent log spam
 
 let cachedSpotifyToken = null;
 let spotifyTokenExpiresAt = 0;
@@ -130,9 +131,17 @@ async function searchTidalForTrack(title, artist) {
 
 // 3. Dynamically Scrape Live Apple Music Developer Token
 async function getAppleDeveloperToken() {
+  // Return cached token if valid
   if (cachedAppleToken && Date.now() < appleTokenExpiresAt) {
     return cachedAppleToken;
   }
+
+  // Cooldown Guard: If scraping failed in the last 10 minutes, skip re-scraping HTML
+  if (Date.now() - lastAppleTokenAttempt < 10 * 60 * 1000) {
+    return null;
+  }
+
+  lastAppleTokenAttempt = Date.now();
 
   try {
     console.log('[Apple Motion] Fetching live Apple Music developer token...');
@@ -173,6 +182,7 @@ async function getAppleDeveloperToken() {
   } catch (err) {
     console.warn(`[Apple Motion] Failed to scrape Apple token: ${err.message}`);
   }
+
   return null;
 }
 
@@ -325,7 +335,6 @@ async function getSpotifyToken() {
   try {
     const cleanCookie = SPOTIFY_SP_DC.replace('sp_dc=', '').trim();
     
-    // Beefed-up headers to perfectly mimic a real Chrome browser and bypass the WAF
     const headers = {
       'Cookie': `sp_dc=${cleanCookie}`,
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -343,18 +352,17 @@ async function getSpotifyToken() {
 
     const res = await fetch('https://open.spotify.com/', {
       headers,
-      signal: AbortSignal.timeout(6000), // Slightly longer timeout for full page load
+      signal: AbortSignal.timeout(6000),
     });
 
     const html = await res.text();
 
-    // METHOD 1: Look for the exact JSON session script tag (Most reliable)
     const sessionMatch = html.match(/<script id="session"[^>]*>([^<]+)<\/script>/);
     if (sessionMatch && sessionMatch[1]) {
       try {
         const sessionData = JSON.parse(sessionMatch[1]);
         if (sessionData.isAnonymous) {
-          console.warn('[Spotify] sp_dc cookie is invalid or expired (Parsed Anonymous). Please get a new one.');
+          console.warn('[Spotify] sp_dc cookie is invalid or expired (Parsed Anonymous).');
           return null;
         }
         cachedSpotifyToken = sessionData.accessToken;
@@ -366,7 +374,6 @@ async function getSpotifyToken() {
       }
     }
 
-    // METHOD 2: Smarter loose Regex (Fallback)
     const tokenMatch = html.match(/"accessToken"\s*:\s*"([^"]+)"/);
     const expiryMatch = html.match(/"accessTokenExpirationTimestampMs"\s*:\s*(\d+)/);
     const isAnonymousMatch = html.match(/"isAnonymous"\s*:\s*(true|false)/);
@@ -374,7 +381,7 @@ async function getSpotifyToken() {
     if (tokenMatch && tokenMatch[1]) {
       const isAnon = isAnonymousMatch && isAnonymousMatch[1] === 'true';
       if (isAnon) {
-        console.warn('[Spotify] sp_dc cookie is invalid or expired (Regex Anonymous). Please get a new one.');
+        console.warn('[Spotify] sp_dc cookie is invalid or expired (Regex Anonymous).');
         return null;
       }
       cachedSpotifyToken = tokenMatch[1];
@@ -396,7 +403,6 @@ async function getSpotifyLyrics(title, artist) {
   if (!token) return null;
 
   try {
-    // A. Search for the Spotify Track ID
     const query = encodeURIComponent(`track:${title} artist:${artist}`);
     console.log(`[Spotify] Searching for track ID: "${title}" by "${artist}"`);
     
@@ -412,7 +418,6 @@ async function getSpotifyLyrics(title, artist) {
       return null;
     }
 
-    // B. Fetch hidden lyrics payload
     console.log(`[Spotify] Fetching lyrics for Track ID: ${trackId}`);
     const lyricsRes = await fetch(`https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&market=from_token`, {
       headers: {
@@ -432,7 +437,6 @@ async function getSpotifyLyrics(title, artist) {
     let lrcString = '';
     let plainString = '';
 
-    // C. Convert Spotify's JSON payload into standard Enhanced LRC text format
     spotifyLyrics.lines.forEach(line => {
       plainString += line.words + '\n';
 
@@ -443,7 +447,6 @@ async function getSpotifyLyrics(title, artist) {
       
       let lineContent = '';
 
-      // Map syllable-level timestamps if it's a word-by-word track
       if (isWordByWord && line.syllables && line.syllables.length > 0) {
         line.syllables.forEach(syllable => {
            const sylTime = parseInt(syllable.startTimeMs, 10);
