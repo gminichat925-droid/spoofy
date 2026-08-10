@@ -19,7 +19,7 @@ let tokenExpiresAt = 0;
 
 let cachedAppleToken = null;
 let appleTokenExpiresAt = 0;
-let lastAppleTokenAttempt = 0; // Cooldown tracker to prevent log spam
+let lastAppleTokenAttempt = 0; // Cooldown tracker to prevent endless re-scraping
 
 let cachedSpotifyToken = null;
 let spotifyTokenExpiresAt = 0;
@@ -131,12 +131,11 @@ async function searchTidalForTrack(title, artist) {
 
 // 3. Dynamically Scrape Live Apple Music Developer Token
 async function getAppleDeveloperToken() {
-  // Return cached token if valid
   if (cachedAppleToken && Date.now() < appleTokenExpiresAt) {
     return cachedAppleToken;
   }
 
-  // Cooldown Guard: If scraping failed in the last 10 minutes, skip re-scraping HTML
+  // Cooldown Guard: If scraping failed in the last 10 minutes, do not attempt re-scraping
   if (Date.now() - lastAppleTokenAttempt < 10 * 60 * 1000) {
     return null;
   }
@@ -246,7 +245,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
           'User-Agent': IPHONE_USER_AGENT,
           'Accept-Language': 'en-US',
         },
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(4000),
       });
 
       if (searchRes.ok) {
@@ -262,7 +261,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
               'User-Agent': IPHONE_USER_AGENT,
               'Accept-Language': 'en-US',
             },
-            signal: AbortSignal.timeout(5000),
+            signal: AbortSignal.timeout(4000),
           });
 
           if (detailRes.ok) {
@@ -282,7 +281,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(searchQuery)}&entity=album&limit=3`;
-    const searchRes = await fetch(iTunesUrl, { signal: AbortSignal.timeout(5000) });
+    const searchRes = await fetch(iTunesUrl, { signal: AbortSignal.timeout(4000) });
     if (!searchRes.ok) return null;
 
     const searchData = await searchRes.json();
@@ -291,7 +290,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     const pageRes = await fetch(albumUrl, {
       headers: { 'User-Agent': IPHONE_USER_AGENT },
-      signal: AbortSignal.timeout(6000),
+      signal: AbortSignal.timeout(4000),
     });
 
     if (!pageRes.ok) return null;
@@ -572,7 +571,7 @@ app.get('/api/stream', async (req, res) => {
       return res.status(400).json({ error: 'trackId OR (title and artist) is required' });
     }
 
-    // Resolve Tidal trackId using title and artist from Spotify
+    // Resolve Tidal trackId using title and artist if missing
     if (!trackId) {
       trackId = await searchTidalForTrack(title, artist);
       if (!trackId) {
@@ -617,7 +616,7 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Apple Motion & Dynamic Color Extraction Endpoint
+// Apple Motion & Dynamic Color Extraction Endpoint (Non-blocking with hard timeout)
 app.get('/api/motion', async (req, res) => {
   try {
     const { album, artist, coverUrl } = req.query;
@@ -625,8 +624,7 @@ app.get('/api/motion', async (req, res) => {
       return res.status(400).json({ error: 'Both album and artist query parameters are required.' });
     }
 
-    const motionUrl = await getAppleMotionUrl(album, artist);
-
+    // 1. Extract dynamic color palette fast
     let themeColor = '#2A2E3D';
     if (coverUrl) {
       try {
@@ -639,6 +637,20 @@ app.get('/api/motion', async (req, res) => {
       } catch (colorErr) {
         console.warn('[Color] Failed to extract color from URL:', colorErr.message);
       }
+    }
+
+    // 2. Hard 3.5-second timeout for Apple Motion scraping
+    const timeoutPromise = new Promise((resolve) => 
+      setTimeout(() => resolve(null), 3500)
+    );
+
+    const motionUrl = await Promise.race([
+      getAppleMotionUrl(album, artist),
+      timeoutPromise
+    ]);
+
+    if (!motionUrl) {
+      console.log(`[Apple Motion] Search timed out or returned no video for "${album}"`);
     }
 
     res.json({
