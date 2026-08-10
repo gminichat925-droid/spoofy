@@ -137,10 +137,10 @@ async function getAppleDeveloperToken() {
   return null;
 }
 
-// 4. Extract Apple Motion Artwork (Dual-Engine: Amp API + Unescaped Web Scraper)
+// 4. Extract Apple Motion Artwork (Prioritizing Tall/Portrait Assets)
 async function getAppleMotionUrl(albumTitle, artistName) {
   const searchQuery = `${albumTitle} ${artistName}`;
-  console.log(`[Apple Motion] Searching for: "${searchQuery}"`);
+  console.log(`[Apple Motion] Searching for tall artwork: "${searchQuery}"`);
 
   // ENGINE 1: Apple Catalog Amp API
   const token = await getAppleDeveloperToken();
@@ -182,11 +182,12 @@ async function getAppleMotionUrl(albumTitle, artistName) {
               albumObj?.relationships?.editorialVideo?.data?.[0]?.attributes;
 
             if (editorialVideo) {
+              // PRIORITY: Check for tall/portrait assets before square
               const motionObj =
-                editorialVideo.motionDetailSquare ||
-                editorialVideo.motionSquare ||
                 editorialVideo.motionDetailTall ||
-                editorialVideo.motionTall;
+                editorialVideo.motionTall ||
+                editorialVideo.motionDetailSquare ||
+                editorialVideo.motionSquare;
 
               const videoUrl =
                 motionObj?.video ||
@@ -194,7 +195,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
                 motionObj?.response?.video;
 
               if (videoUrl) {
-                console.log('[Apple Motion] Success via Amp API!');
+                console.log('[Apple Motion] Found video via Amp API!');
                 return videoUrl;
               }
             }
@@ -206,7 +207,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // ENGINE 2: Unescaped Deep HTML Web Scraper
+  // ENGINE 2: Unescaped Deep HTML Web Scraper (Fallback)
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
@@ -237,14 +238,18 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     );
 
     if (videoMatches && videoMatches.length > 0) {
-      const squareVideo =
+      // PRIORITY: Find URLs containing 'tall' or 'portrait' keywords first
+      const tallVideo =
         videoMatches.find(
           (u) =>
-            u.includes('square') || u.includes('motion') || u.includes('editorial')
+            u.includes('tall') ||
+            u.includes('portrait') ||
+            u.includes('3x4') ||
+            u.includes('9x16')
         ) || videoMatches[0];
 
-      console.log('[Apple Motion] Success via Unescaped Scraper!');
-      return squareVideo;
+      console.log('[Apple Motion] Found video via Unescaped Scraper!');
+      return tallVideo;
     }
   } catch (err) {
     console.warn('[Apple Motion] Engine 2 error:', err.message);
