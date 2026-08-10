@@ -41,6 +41,7 @@ async function getAccessToken() {
       grant_type: 'refresh_token',
       scope: 'r_usr w_usr',
     }),
+    signal: AbortSignal.timeout(5000), // 5-second timeout
   });
 
   if (!res.ok) {
@@ -65,6 +66,7 @@ async function getTidalStreamUrl(trackId) {
       'Authorization': `Bearer ${token}`,
       'x-tidal-token': CLIENT_ID,
     },
+    signal: AbortSignal.timeout(5000),
   });
 
   if (!res.ok) {
@@ -104,7 +106,9 @@ async function getAppleDeveloperToken() {
         'User-Agent':
           'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
       },
+      signal: AbortSignal.timeout(5000), // Prevent infinite hangs
     });
+    
     const html = await res.text();
 
     const metaMatch = html.match(/name="apple-music-developer-token"\s+content="([^"]+)"/);
@@ -117,7 +121,9 @@ async function getAppleDeveloperToken() {
 
     const jsMatch = html.match(/\/assets\/index[^\"]+\.js/);
     if (jsMatch) {
-      const jsRes = await fetch(`https://music.apple.com${jsMatch[0]}`);
+      const jsRes = await fetch(`https://music.apple.com${jsMatch[0]}`, {
+        signal: AbortSignal.timeout(5000),
+      });
       const jsText = await jsRes.text();
       const tokenMatch = jsText.match(
         /eyJhbGciOiJFUzI1NiI[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/
@@ -130,9 +136,9 @@ async function getAppleDeveloperToken() {
       }
     }
   } catch (err) {
-    console.warn('[Apple Motion] Failed to scrape Apple token:', err.message);
+    console.warn(`[Apple Motion] Failed to scrape Apple token: ${err.message}`);
   }
-  return null;
+  return null; // Will fallback to Engine 2 if token fetch fails
 }
 
 // Helper A: Recursive JSON traversal EXCLUSIVELY for motionDetailTall (skips square keys)
@@ -146,7 +152,6 @@ function findTallVideoInJson(obj) {
   }
 
   for (const key of Object.keys(obj)) {
-    // CRITICAL: Skip square keys so we never accidentally fall back to square
     if (key === 'motionDetailSquare' || key === 'motionSquare') continue;
 
     if (typeof obj[key] === 'object' && obj[key] !== null) {
@@ -168,10 +173,7 @@ function extractTallUrlFromRawString(str) {
   const targetIdx = tallIdx !== -1 ? tallIdx : tallShortIdx;
   if (targetIdx === -1) return null;
 
-  // Slice a window of 800 characters starting directly at motionDetailTall
   const snippet = str.slice(targetIdx, targetIdx + 800);
-
-  // If motionDetailSquare appears inside the snippet window, cut off before it
   const squareInSnippetIdx = snippet.indexOf('"motionDetailSquare"');
   const safeSnippet = squareInSnippetIdx !== -1 ? snippet.slice(0, squareInSnippetIdx) : snippet;
 
@@ -206,6 +208,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
           'User-Agent': IPHONE_USER_AGENT,
           'Accept-Language': 'en-US',
         },
+        signal: AbortSignal.timeout(5000),
       });
 
       if (searchRes.ok) {
@@ -221,6 +224,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
               'User-Agent': IPHONE_USER_AGENT,
               'Accept-Language': 'en-US',
             },
+            signal: AbortSignal.timeout(5000),
           });
 
           if (detailRes.ok) {
@@ -234,7 +238,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
         }
       }
     } catch (err) {
-      console.warn('[Apple Motion] Engine 1 error:', err.message);
+      console.warn(`[Apple Motion] Engine 1 error/timeout: ${err.message}`);
     }
   }
 
@@ -243,7 +247,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
       searchQuery
     )}&entity=album&limit=3`;
-    const searchRes = await fetch(iTunesUrl);
+    const searchRes = await fetch(iTunesUrl, { signal: AbortSignal.timeout(5000) });
     if (!searchRes.ok) return null;
 
     const searchData = await searchRes.json();
@@ -252,13 +256,13 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     const pageRes = await fetch(albumUrl, {
       headers: { 'User-Agent': IPHONE_USER_AGENT },
+      signal: AbortSignal.timeout(6000), // Slightly longer for full HTML doc
     });
 
     if (!pageRes.ok) return null;
 
     const html = await pageRes.text();
 
-    // 1. Try parsing JSON script blocks safely
     const scriptMatches = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
     for (const scriptTag of scriptMatches) {
       if (scriptTag.includes('motionDetailTall') || scriptTag.includes('motionTall')) {
@@ -271,7 +275,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
             return tallUrl;
           }
         } catch (e) {
-          // 2. Isolated string slicing if script tag is raw JS
           const slicedUrl = extractTallUrlFromRawString(cleanScript);
           if (slicedUrl) {
             console.log('[Apple Motion] Found TALL video via Isolated String Slicing!');
@@ -281,14 +284,13 @@ async function getAppleMotionUrl(albumTitle, artistName) {
       }
     }
 
-    // 3. Fallback isolated string slice directly on HTML
     const htmlSlicedUrl = extractTallUrlFromRawString(html);
     if (htmlSlicedUrl) {
       console.log('[Apple Motion] Found TALL video via HTML Isolated Slice!');
       return htmlSlicedUrl;
     }
   } catch (err) {
-    console.warn('[Apple Motion] Engine 2 error:', err.message);
+    console.warn(`[Apple Motion] Engine 2 error/timeout: ${err.message}`);
   }
 
   return null;
@@ -318,6 +320,7 @@ app.get('/api/search', async (req, res) => {
         'Authorization': `Bearer ${token}`,
         'x-tidal-token': CLIENT_ID,
       },
+      signal: AbortSignal.timeout(5000),
     });
 
     if (!searchRes.ok) {
