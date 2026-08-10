@@ -10,6 +10,7 @@ app.use(cors());
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
+const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC; // New Spotify Cookie
 
 const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
@@ -18,6 +19,9 @@ let tokenExpiresAt = 0;
 
 let cachedAppleToken = null;
 let appleTokenExpiresAt = 0;
+
+let cachedSpotifyToken = null;
+let spotifyTokenExpiresAt = 0;
 
 // 1. Refresh Tidal Access Token
 async function getAccessToken() {
@@ -142,7 +146,7 @@ async function getAppleDeveloperToken() {
   return null;
 }
 
-// Helper A: Recursive JSON traversal EXCLUSIVELY for motionDetailTall (skips square keys)
+// 4. Extract Apple Motion Artwork
 function findTallVideoInJson(obj) {
   if (!obj || typeof obj !== 'object') return null;
 
@@ -160,17 +164,13 @@ function findTallVideoInJson(obj) {
       if (result) return result;
     }
   }
-
   return null;
 }
 
-// Helper B: Isolated text slicing specifically around motionDetailTall
 function extractTallUrlFromRawString(str) {
   if (!str) return null;
-
   const tallIdx = str.indexOf('"motionDetailTall"');
   const tallShortIdx = str.indexOf('"motionTall"');
-
   const targetIdx = tallIdx !== -1 ? tallIdx : tallShortIdx;
   if (targetIdx === -1) return null;
 
@@ -182,11 +182,9 @@ function extractTallUrlFromRawString(str) {
   if (urlMatch) {
     return urlMatch[0].replace(/\\\/|\\u002F/g, '/');
   }
-
   return null;
 }
 
-// 4. Extract Apple Motion Artwork
 async function getAppleMotionUrl(albumTitle, artistName) {
   const searchQuery = `${albumTitle} ${artistName}`;
   console.log(`[Apple Motion] Searching strictly for tall artwork: "${searchQuery}"`);
@@ -194,7 +192,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
   const IPHONE_USER_AGENT =
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
 
-  // ENGINE 1: Apple Catalog Amp API
   const token = await getAppleDeveloperToken();
   if (token) {
     try {
@@ -243,11 +240,8 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // ENGINE 2: Web Scraper Fallback
   try {
-    const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
-      searchQuery
-    )}&entity=album&limit=3`;
+    const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(searchQuery)}&entity=album&limit=3`;
     const searchRes = await fetch(iTunesUrl, { signal: AbortSignal.timeout(5000) });
     if (!searchRes.ok) return null;
 
@@ -261,7 +255,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     });
 
     if (!pageRes.ok) return null;
-
     const html = await pageRes.text();
 
     const scriptMatches = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
@@ -271,25 +264,16 @@ async function getAppleMotionUrl(albumTitle, artistName) {
         try {
           const json = JSON.parse(cleanScript);
           const tallUrl = findTallVideoInJson(json);
-          if (tallUrl) {
-            console.log('[Apple Motion] Found TALL video via Webpage Script JSON!');
-            return tallUrl;
-          }
+          if (tallUrl) return tallUrl;
         } catch (e) {
           const slicedUrl = extractTallUrlFromRawString(cleanScript);
-          if (slicedUrl) {
-            console.log('[Apple Motion] Found TALL video via Isolated String Slicing!');
-            return slicedUrl;
-          }
+          if (slicedUrl) return slicedUrl;
         }
       }
     }
 
     const htmlSlicedUrl = extractTallUrlFromRawString(html);
-    if (htmlSlicedUrl) {
-      console.log('[Apple Motion] Found TALL video via HTML Isolated Slice!');
-      return htmlSlicedUrl;
-    }
+    if (htmlSlicedUrl) return htmlSlicedUrl;
   } catch (err) {
     console.warn(`[Apple Motion] Engine 2 error/timeout: ${err.message}`);
   }
@@ -297,15 +281,134 @@ async function getAppleMotionUrl(albumTitle, artistName) {
   return null;
 }
 
-// 5. Fetch LRCLIB Lyrics (Prioritizing Word-by-Word)
+// 5. Spotify internal Lyrics Engine (Musixmatch Word-by-Word)
+async function getSpotifyToken() {
+  if (!SPOTIFY_SP_DC) {
+    console.warn('[Spotify] SPOTIFY_SP_DC environment variable is missing.');
+    return null;
+  }
+
+  if (cachedSpotifyToken && Date.now() < spotifyTokenExpiresAt) {
+    return cachedSpotifyToken;
+  }
+
+  try {
+    const res = await fetch('https://open.spotify.com/get_access_token?reason=transport&productType=web_player', {
+      headers: {
+        'Cookie': `sp_dc=${SPOTIFY_SP_DC}`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    const data = await res.json();
+    if (data.isAnonymous) {
+      console.warn('[Spotify] sp_dc cookie is invalid or expired. Token returned anonymous.');
+      return null;
+    }
+
+    cachedSpotifyToken = data.accessToken;
+    spotifyTokenExpiresAt = data.accessTokenExpirationTimestampMs - 60000;
+    console.log('[Spotify] Successfully generated authenticated Web Player token.');
+    return cachedSpotifyToken;
+  } catch (e) {
+    console.warn('[Spotify] Failed to get token:', e.message);
+    return null;
+  }
+}
+
+async function getSpotifyLyrics(title, artist) {
+  const token = await getSpotifyToken();
+  if (!token) return null;
+
+  try {
+    // A. Search for the Spotify Track ID
+    const query = encodeURIComponent(`track:${title} artist:${artist}`);
+    console.log(`[Spotify] Searching for track ID: "${title}" by "${artist}"`);
+    
+    const searchRes = await fetch(`https://api.spotify.com/v1/search?q=${query}&type=track&limit=1`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    
+    const searchData = await searchRes.json();
+    const trackId = searchData.tracks?.items?.[0]?.id;
+    if (!trackId) {
+      console.warn(`[Spotify] Track not found in search.`);
+      return null;
+    }
+
+    // B. Fetch hidden lyrics payload
+    console.log(`[Spotify] Fetching lyrics for Track ID: ${trackId}`);
+    const lyricsRes = await fetch(`https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&market=from_token`, {
+      headers: {
+        'App-Platform': 'WebPlayer',
+        'Authorization': `Bearer ${token}`
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!lyricsRes.ok) return null;
+    const lyricsData = await lyricsRes.json();
+    
+    if (!lyricsData || !lyricsData.lyrics) return null;
+
+    const spotifyLyrics = lyricsData.lyrics;
+    const isWordByWord = spotifyLyrics.syncType === 'SYLLABLE_SYNCED';
+    let lrcString = '';
+    let plainString = '';
+
+    // C. Convert Spotify's JSON payload into standard Enhanced LRC text format
+    spotifyLyrics.lines.forEach(line => {
+      plainString += line.words + '\n';
+
+      if (!line.startTimeMs) return;
+      const lineTime = parseInt(line.startTimeMs, 10);
+      const lMins = String(Math.floor(lineTime / 60000)).padStart(2, '0');
+      const lSecs = ((lineTime % 60000) / 1000).toFixed(2).padStart(5, '0');
+      
+      let lineContent = '';
+
+      // Map syllable-level timestamps if it's a word-by-word track
+      if (isWordByWord && line.syllables && line.syllables.length > 0) {
+        line.syllables.forEach(syllable => {
+           const sylTime = parseInt(syllable.startTimeMs, 10);
+           if (isNaN(sylTime)) {
+             lineContent += syllable.words;
+           } else {
+             const sMins = String(Math.floor(sylTime / 60000)).padStart(2, '0');
+             const sSecs = ((sylTime % 60000) / 1000).toFixed(2).padStart(5, '0');
+             lineContent += `<${sMins}:${sSecs}>${syllable.words}`;
+           }
+        });
+      } else {
+        lineContent = line.words;
+      }
+
+      lrcString += `[${lMins}:${lSecs}]${lineContent}\n`;
+    });
+
+    console.log(`[Spotify] ✅ Success! Word-by-Word: ${isWordByWord}`);
+    return {
+      found: true,
+      isWordByWord: isWordByWord,
+      plainLyrics: plainString.trim(),
+      syncedLyrics: lrcString.trim()
+    };
+  } catch (err) {
+    console.warn(`[Spotify] Lyrics fetch error: ${err.message}`);
+    return null;
+  }
+}
+
+// 6. Fallback LRCLIB Lyrics Engine
 async function getLrclibLyrics(title, artist) {
   const USER_AGENT = 'SpoofyApp/1.0 (spoofy@example.com)';
-
   try {
     const searchUrl = new URL('https://lrclib.net/api/search');
     searchUrl.searchParams.append('q', `${title} ${artist}`);
 
-    console.log(`[LRCLIB] Searching for lyrics: "${title} ${artist}"`);
+    console.log(`[LRCLIB] Fallback searching for lyrics: "${title} ${artist}"`);
     const res = await fetch(searchUrl.toString(), {
       headers: { 'User-Agent': USER_AGENT },
       signal: AbortSignal.timeout(5000),
@@ -314,43 +417,27 @@ async function getLrclibLyrics(title, artist) {
     if (res.ok) {
       const results = await res.json();
       if (results && results.length > 0) {
-        
-        // Regex to detect Enhanced LRC (word-by-word tags like <00:10.50>)
         const enhancedLrcRegex = /<\d{2}:\d{2}\.\d{2,3}>/;
+        const wordByWordMatch = results.find(r => r.syncedLyrics && enhancedLrcRegex.test(r.syncedLyrics));
+        
+        if (wordByWordMatch) return { ...wordByWordMatch, isWordByWord: true };
+        
+        const lineByLineMatch = results.find(r => r.syncedLyrics);
+        if (lineByLineMatch) return { ...lineByLineMatch, isWordByWord: false };
 
-        // PRIORITY 1: Find a result WITH word-by-word sync
-        const wordByWordMatch = results.find(
-          (r) => r.syncedLyrics && enhancedLrcRegex.test(r.syncedLyrics)
-        );
-
-        if (wordByWordMatch) {
-          console.log(`[LRCLIB] ✅ Found WORD-BY-WORD lyrics!`);
-          return { ...wordByWordMatch, isWordByWord: true };
-        }
-
-        // PRIORITY 2: Fallback to standard line-by-line sync
-        const lineByLineMatch = results.find((r) => r.syncedLyrics);
-        if (lineByLineMatch) {
-          console.log(`[LRCLIB] ⚠️ Found LINE-BY-LINE lyrics.`);
-          return { ...lineByLineMatch, isWordByWord: false };
-        }
-
-        // PRIORITY 3: Fallback to plain text
-        console.log(`[LRCLIB] ❌ Only plain lyrics found.`);
         return { ...results[0], isWordByWord: false };
       }
     }
   } catch (err) {
-    console.warn(`[LRCLIB] Lyrics fetch error/timeout: ${err.message}`);
+    console.warn(`[LRCLIB] Lyrics fetch error: ${err.message}`);
   }
-
   return null;
 }
 
 // --- ENDPOINTS ---
 
 app.get('/', (req, res) => {
-  res.json({ status: 'online', message: 'Tidal Audio, Apple Motion & LRCLIB Proxy is running!' });
+  res.json({ status: 'online', message: 'Tidal Audio, Apple Motion & Spotify Lyrics Proxy is running!' });
 });
 
 // Search Tracks
@@ -476,7 +563,7 @@ app.get('/api/motion', async (req, res) => {
   }
 });
 
-// LRCLIB Lyrics Endpoint
+// Lyrics Endpoint (Spotify -> LRCLIB Fallback)
 app.get('/api/lyrics', async (req, res) => {
   try {
     const { title, artist } = req.query;
@@ -485,20 +572,26 @@ app.get('/api/lyrics', async (req, res) => {
       return res.status(400).json({ error: 'Both title and artist query parameters are required.' });
     }
 
-    const lyricsData = await getLrclibLyrics(title, artist);
+    // Try Spotify first
+    let lyricsData = await getSpotifyLyrics(title, artist);
+    
+    // If Spotify fails or sp_dc isn't set, fallback to LRCLIB
+    if (!lyricsData) {
+      const fallbackData = await getLrclibLyrics(title, artist);
+      if (fallbackData) {
+        lyricsData = {
+          found: true,
+          isWordByWord: fallbackData.isWordByWord,
+          plainLyrics: fallbackData.plainLyrics || null,
+          syncedLyrics: fallbackData.syncedLyrics || null,
+        };
+      }
+    }
 
     if (lyricsData) {
-      res.json({
-        found: true,
-        isWordByWord: lyricsData.isWordByWord, // Tells frontend if we have true karaoke
-        plainLyrics: lyricsData.plainLyrics || null,
-        syncedLyrics: lyricsData.syncedLyrics || null,
-      });
+      res.json(lyricsData);
     } else {
-      res.json({
-        found: false,
-        message: 'No lyrics found for this track.',
-      });
+      res.json({ found: false, message: 'No lyrics found for this track across all engines.' });
     }
   } catch (error) {
     res.status(500).json({ error: error.message });
