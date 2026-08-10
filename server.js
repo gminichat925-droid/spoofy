@@ -282,6 +282,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 }
 
 // 5. Spotify internal Lyrics Engine (Musixmatch Word-by-Word)
+// 5. Spotify internal Lyrics Engine (Musixmatch Word-by-Word)
 async function getSpotifyToken() {
   if (!SPOTIFY_SP_DC) {
     console.warn('[Spotify] SPOTIFY_SP_DC environment variable is missing.');
@@ -293,44 +294,70 @@ async function getSpotifyToken() {
   }
 
   try {
-    // Ensure the cookie is formatted correctly even if pasted with/without the sp_dc= prefix
     const cleanCookie = SPOTIFY_SP_DC.replace('sp_dc=', '').trim();
     
-    // Updated Method: Scrape token directly from the Web Player HTML payload
+    // Beefed-up headers to perfectly mimic a real Chrome browser and bypass the WAF
+    const headers = {
+      'Cookie': `sp_dc=${cleanCookie}`,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1'
+    };
+
     const res = await fetch('https://open.spotify.com/', {
-      headers: {
-        'Cookie': `sp_dc=${cleanCookie}`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-      },
-      signal: AbortSignal.timeout(5000),
+      headers,
+      signal: AbortSignal.timeout(6000), // Slightly longer timeout for full page load
     });
 
     const html = await res.text();
 
-    // Spotify embeds the session JSON deep inside a script tag in the HTML body
-    const tokenMatch = html.match(/"accessToken":"([^"]+)"/);
-    const expiryMatch = html.match(/"accessTokenExpirationTimestampMs":(\d+)/);
-    const isAnonymousMatch = html.match(/"isAnonymous":\s*(true|false)/);
+    // METHOD 1: Look for the exact JSON session script tag (Most reliable)
+    const sessionMatch = html.match(/<script id="session"[^>]*>([^<]+)<\/script>/);
+    if (sessionMatch && sessionMatch[1]) {
+      try {
+        const sessionData = JSON.parse(sessionMatch[1]);
+        if (sessionData.isAnonymous) {
+          console.warn('[Spotify] sp_dc cookie is invalid or expired (Parsed Anonymous). Please get a new one.');
+          return null;
+        }
+        cachedSpotifyToken = sessionData.accessToken;
+        spotifyTokenExpiresAt = sessionData.accessTokenExpirationTimestampMs - 60000;
+        console.log('[Spotify] ✅ Successfully parsed token from JSON script tag!');
+        return cachedSpotifyToken;
+      } catch (e) {
+        console.warn('[Spotify] Found session script but failed to parse JSON.');
+      }
+    }
+
+    // METHOD 2: Smarter loose Regex (Fallback)
+    const tokenMatch = html.match(/"accessToken"\s*:\s*"([^"]+)"/);
+    const expiryMatch = html.match(/"accessTokenExpirationTimestampMs"\s*:\s*(\d+)/);
+    const isAnonymousMatch = html.match(/"isAnonymous"\s*:\s*(true|false)/);
 
     if (tokenMatch && tokenMatch[1]) {
       const isAnon = isAnonymousMatch && isAnonymousMatch[1] === 'true';
       if (isAnon) {
-        console.warn('[Spotify] sp_dc cookie is invalid or expired. Token returned anonymous.');
+        console.warn('[Spotify] sp_dc cookie is invalid or expired (Regex Anonymous). Please get a new one.');
         return null;
       }
-
       cachedSpotifyToken = tokenMatch[1];
-      // Default to a 50-minute expiration if exact timestamp parsing fails
-      spotifyTokenExpiresAt = expiryMatch ? parseInt(expiryMatch[1], 10) - 60000 : Date.now() + 3000000; 
-      
-      console.log('[Spotify] Successfully scraped authenticated Web Player token.');
+      spotifyTokenExpiresAt = expiryMatch ? parseInt(expiryMatch[1], 10) - 60000 : Date.now() + 3000000;
+      console.log('[Spotify] ✅ Successfully scraped token via Regex!');
       return cachedSpotifyToken;
-    } else {
-      console.warn('[Spotify] Failed to scrape token from HTML. The page structure might have changed.');
-      return null;
     }
+
+    console.warn('[Spotify] ❌ Failed to scrape token. Railway IP might be blocked, or HTML changed.');
+    return null;
   } catch (e) {
-    console.warn('[Spotify] Failed to get token:', e.message);
+    console.warn('[Spotify] Fetch error:', e.message);
     return null;
   }
 }
