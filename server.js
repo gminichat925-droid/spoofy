@@ -10,7 +10,7 @@ app.use(cors());
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
-const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC;
+const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC; // New Spotify Cookie
 
 const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
@@ -99,6 +99,45 @@ async function searchTidalForTrack(title, artist) {
     console.warn(`[Tidal] Search error: ${error.message}`);
   }
   return null;
+}
+
+// 2.6 Fetch Direct Stream URL for Music Videos
+async function getTidalVideoStreamUrl(videoId) {
+  const token = await getAccessToken();
+
+  // Notice the path is /videos/ and query uses videoquality=HIGH
+  const url = `https://api.tidal.com/v1/videos/${videoId}/playbackinfopostpaywall?videoquality=HIGH&playbackmode=STREAM&assetpresentation=FULL`;
+
+  const res = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'x-tidal-token': CLIENT_ID,
+    },
+    signal: AbortSignal.timeout(5000),
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Tidal Video API failed: ${res.status} ${errorText}`);
+  }
+
+  const data = await res.json();
+
+  if (data.manifest) {
+    const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
+
+    try {
+      const manifestJson = JSON.parse(decodedManifest);
+      if (manifestJson.urls && manifestJson.urls.length > 0) {
+        return manifestJson.urls[0]; // Returns the direct .m3u8 URL
+      }
+    } catch (e) {
+      const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
+      if (urlMatch) return urlMatch[0];
+    }
+  }
+
+  throw new Error('No video URL found in Tidal manifest.');
 }
 
 // 3. Ultra-Fast Apple Music Developer Token Scraper (No Regex over massive HTML)
@@ -408,6 +447,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'online' });
 });
 
+// Audio Search
 app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query;
@@ -437,6 +477,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
+// Audio Stream
 app.get('/api/stream', async (req, res) => {
   try {
     let { trackId, title, artist } = req.query;
@@ -463,6 +504,57 @@ app.get('/api/stream', async (req, res) => {
     Readable.fromWeb(tidalResponse.body).pipe(res);
   } catch (error) {
     if (!res.headersSent) res.status(500).json({ error: error.message });
+  }
+});
+
+// Video Search
+app.get('/api/search-video', async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q) return res.status(400).json({ error: 'Search query required.' });
+
+    const token = await getAccessToken();
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=10&types=VIDEOS&countryCode=US`;
+    
+    const searchRes = await fetch(searchUrl, {
+      headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!searchRes.ok) throw new Error('Video search request failed');
+    
+    const searchData = await searchRes.json();
+    const rawItems = searchData.videos?.items || searchData.items || [];
+
+    const videos = rawItems.map((v) => ({
+      id: v.id,
+      title: v.title,
+      artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
+      thumbnailUrl: v.imageId ? `https://resources.tidal.com/images/${v.imageId.replace(/-/g, '/')}/320x240.jpg` : null,
+      duration: v.duration
+    }));
+
+    res.json({ videos });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Video Stream URL (Returns .m3u8 CDN link)
+app.get('/api/video', async (req, res) => {
+  try {
+    const { videoId } = req.query;
+    if (!videoId) return res.status(400).json({ error: 'videoId is required' });
+
+    const directStreamUrl = await getTidalVideoStreamUrl(videoId);
+
+    res.json({
+      success: true,
+      videoUrl: directStreamUrl
+    });
+  } catch (error) {
+    console.error('Video Fetch Error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
