@@ -10,7 +10,7 @@ app.use(cors());
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
-const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC; // New Spotify Cookie
+const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC;
 
 const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
@@ -105,7 +105,6 @@ async function searchTidalForTrack(title, artist) {
 async function getTidalVideoStreamUrl(videoId) {
   const token = await getAccessToken();
 
-  // Notice the path is /videos/ and query uses videoquality=HIGH
   const url = `https://api.tidal.com/v1/videos/${videoId}/playbackinfopostpaywall?videoquality=HIGH&playbackmode=STREAM&assetpresentation=FULL`;
 
   const res = await fetch(url, {
@@ -129,7 +128,7 @@ async function getTidalVideoStreamUrl(videoId) {
     try {
       const manifestJson = JSON.parse(decodedManifest);
       if (manifestJson.urls && manifestJson.urls.length > 0) {
-        return manifestJson.urls[0]; // Returns the direct .m3u8 URL
+        return manifestJson.urls[0]; 
       }
     } catch (e) {
       const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
@@ -140,10 +139,10 @@ async function getTidalVideoStreamUrl(videoId) {
   throw new Error('No video URL found in Tidal manifest.');
 }
 
-// 3. Ultra-Fast Apple Music Developer Token Scraper (No Regex over massive HTML)
+// 3. Ultra-Fast Apple Music Developer Token Scraper
 async function getAppleDeveloperToken() {
   if (cachedAppleToken && Date.now() < appleTokenExpiresAt) return cachedAppleToken;
-  if (Date.now() - lastAppleTokenAttempt < 10 * 60 * 1000) return null; // 10 min cooldown
+  if (Date.now() - lastAppleTokenAttempt < 10 * 60 * 1000) return null; 
 
   lastAppleTokenAttempt = Date.now();
 
@@ -158,7 +157,6 @@ async function getAppleDeveloperToken() {
     
     const html = await res.text();
 
-    // METHOD A: Fast string search for Meta Tag
     const metaKey = 'apple-music-developer-token';
     const metaStart = html.indexOf(metaKey);
     if (metaStart !== -1) {
@@ -175,7 +173,6 @@ async function getAppleDeveloperToken() {
       }
     }
 
-    // METHOD B: Fast string search for JS Bundle
     const jsStart = html.indexOf('/assets/index');
     if (jsStart !== -1) {
       const jsEnd = html.indexOf('"', jsStart);
@@ -187,7 +184,6 @@ async function getAppleDeveloperToken() {
           
           const jwtStart = jsText.indexOf('eyJhbGciOiJFUzI1NiI');
           if (jwtStart !== -1) {
-            // Slice a tiny 200 char chunk so regex doesn't freeze the server
             const tinySnippet = jsText.substring(jwtStart, jwtStart + 200);
             const match = tinySnippet.match(/eyJhbGciOiJFUzI1NiI[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
             if (match) {
@@ -232,7 +228,6 @@ function extractTallUrlFromRawString(str) {
   const targetIdx = tallIdx !== -1 ? tallIdx : tallShortIdx;
   if (targetIdx === -1) return null;
 
-  // Safe slicing prevents regex freeze
   const snippet = str.slice(targetIdx, targetIdx + 800);
   const squareInSnippetIdx = snippet.indexOf('"motionDetailSquare"');
   const safeSnippet = squareInSnippetIdx !== -1 ? snippet.slice(0, squareInSnippetIdx) : snippet;
@@ -289,7 +284,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     }
   }
 
-  // Engine 2: Web Scraper (Fast String Slicing)
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(searchQuery)}&entity=album&limit=3`;
     const searchRes = await fetch(iTunesUrl, { signal: AbortSignal.timeout(4000) });
@@ -307,7 +301,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     if (!pageRes.ok) return null;
     const html = await pageRes.text();
 
-    // Use fast string slicer on the entire HTML page (Instantly bypasses RegExp locks)
     const htmlSlicedUrl = extractTallUrlFromRawString(html);
     if (htmlSlicedUrl) {
        console.log('[Apple Motion] ✅ Found TALL video via fast HTML Slice!');
@@ -507,19 +500,41 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Video Search (Filtered for Official/Studio Videos)
+// Scoring helper to rank videos and aggressively punish live performances
+function getVideoScore(video, targetTitle) {
+  let score = 0;
+  const vTitle = (video.title || '').toLowerCase();
+  const target = targetTitle.toLowerCase();
+
+  // 1. Point bonuses for matching the exact title
+  if (vTitle === target) score += 100;
+  else if (vTitle.includes(target)) score += 50;
+  else if (target.includes(vTitle)) score += 20;
+
+  // 2. Point bonuses for explicit studio keywords
+  if (/\b(official|music video)\b/i.test(vTitle)) score += 30;
+  if (/\b(lyric|lyrics)\b/i.test(vTitle)) score += 15;
+
+  // 3. MASSIVE penalty to drop live performances to the bottom
+  const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|live at)\b/i;
+  if (liveRegex.test(vTitle)) {
+    score -= 200;
+  }
+
+  return score;
+}
+
+// Video Search (Filtered and Ranked for Studio Videos)
 app.get('/api/search-video', async (req, res) => {
   try {
     const { q } = req.query;
     if (!q) return res.status(400).json({ error: 'Search query required.' });
 
     const token = await getAccessToken();
-    
-    // Check if the user explicitly asked for a live performance
     const isExplicitlyLive = /\b(live|performance|concert|festival|session|tour|unplugged|acoustic)\b/i.test(q);
     
-    // Use the raw query. We don't append "Official Video" because Tidal uses strict track names.
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=15&types=VIDEOS&countryCode=US`;
+    // Increased limit to 30 to dig deeper for buried official videos
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=30&types=VIDEOS&countryCode=US`;
     
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
@@ -531,9 +546,12 @@ app.get('/api/search-video', async (req, res) => {
     const searchData = await searchRes.json();
     let rawItems = searchData.videos?.items || searchData.items || [];
 
-    // Filter out live performances if not explicitly requested
     if (!isExplicitlyLive) {
-      const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|vevo lift|live at|acoustic)\b/i;
+      // Sort items so Official videos go to the top, and negative-scored Live videos drop to the bottom
+      rawItems.sort((a, b) => getVideoScore(b, q) - getVideoScore(a, q));
+      
+      // Completely strip out any videos that still trigger the live penalty
+      const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|live at)\b/i;
       const studioVideos = rawItems.filter(v => !liveRegex.test(v.title || ''));
       if (studioVideos.length > 0) {
         rawItems = studioVideos;
@@ -579,11 +597,10 @@ app.get('/api/official-video', async (req, res) => {
     if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
 
     const token = await getAccessToken();
-    
-    // Search strictly by Title and Artist so Tidal finds the exact studio video
     const searchQuery = `${title} ${artist}`;
     
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=15&types=VIDEOS&countryCode=US`;
+    // Digging up to 30 items deep to bypass popular live performances
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=30&types=VIDEOS&countryCode=US`;
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
       signal: AbortSignal.timeout(5000),
@@ -593,26 +610,20 @@ app.get('/api/official-video', async (req, res) => {
     const searchData = await searchRes.json();
     const items = searchData.videos?.items || searchData.items || [];
 
-    // Expanded Regex to catch MTV Unplugged and Acoustic versions
-    const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic)\b/i;
-    
-    // 1. Strict Match: Non-live AND the title includes the exact song name
-    let bestVideo = items.find(v => {
-      const isLive = liveRegex.test(v.title || '');
-      const isTitleMatch = (v.title || '').toLowerCase().includes(title.toLowerCase());
-      return !isLive && isTitleMatch;
-    });
-
-    // 2. Fallback: Any Non-live video
-    if (!bestVideo) {
-      bestVideo = items.find(v => !liveRegex.test(v.title || ''));
+    if (items.length === 0) {
+      return res.json({ found: false, message: 'No videos found for this track.' });
     }
-    
-    // 3. Last Resort: First returned item
-    if (!bestVideo && items.length > 0) bestVideo = items[0];
 
-    if (!bestVideo) {
-      return res.json({ found: false, message: 'No official video found.' });
+    // Use our new Scoring Engine to pick the absolute best Official Video
+    items.sort((a, b) => getVideoScore(b, title) - getVideoScore(a, title));
+
+    const bestVideo = items[0];
+    const topScore = getVideoScore(bestVideo, title);
+
+    // Guard Clause: If the top-scoring video STILL has a negative score, 
+    // it means ONLY live performances exist. We bravely refuse to return it.
+    if (topScore < 0) {
+      return res.json({ found: false, message: 'Only live performances exist on Tidal. Studio video unavailable.' });
     }
 
     const directStreamUrl = await getTidalVideoStreamUrl(bestVideo.id);
