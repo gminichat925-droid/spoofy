@@ -53,11 +53,11 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
-// 2. Fetch Direct Stream URL from Tidal Manifest (With DRM & Spatial Audio Bypass)
+// 2. Fetch Direct Stream URL from Tidal Manifest (With DASH Bypass & DRM Check)
 async function getTidalStreamUrl(trackId, quality = 'HIGH') {
   const token = await getAccessToken();
   
-  // Added &audioMode=STEREO to prevent silent Dolby Atmos / 360 Reality Audio streams
+  // Added &audioMode=STEREO to prevent silent Dolby Atmos streams
   const url = `https://api.tidal.com/v1/tracks/${trackId}/playbackinfopostpaywall?audioquality=${quality}&playbackmode=STREAM&assetpresentation=FULL&audioMode=STEREO`;
 
   const res = await fetch(url, {
@@ -68,33 +68,41 @@ async function getTidalStreamUrl(trackId, quality = 'HIGH') {
   if (!res.ok) throw new Error(`Tidal API playback info failed: ${res.status}`);
   const data = await res.json();
 
+  // 🚨 DASH MANIFEST CHECK: Prevents the "Pure Silence" bug.
+  // Our proxy cannot stream fragmented DASH XML playlists natively. We must downgrade to get the direct AAC file.
+  if (data.manifestMimeType === 'application/dash+xml') {
+    if (quality === 'HIGH') {
+      console.log(`[Tidal] ⚠️ Track ${trackId} uses fragmented DASH XML. Downgrading to LOW (AAC 320) for direct streaming...`);
+      return await getTidalStreamUrl(trackId, 'LOW');
+    } else {
+      throw new Error('Track is strictly DASH formatted. Cannot proxy directly.');
+    }
+  }
+
   if (data.manifest) {
     const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
     
     try {
       const manifestJson = JSON.parse(decodedManifest);
       
-      // 🚨 DRM CHECK: If the track is encrypted, we must downgrade to bypass it
+      // 🚨 DRM CHECK: Downgrade if the track is encrypted
       const isDRM = manifestJson.encryptionType && manifestJson.encryptionType !== 'NONE';
       
       if (isDRM) {
         console.warn(`[Tidal] 🔒 Track ${trackId} is DRM Protected at ${quality} quality.`);
-        
         if (quality === 'HIGH') {
-          console.log(`[Tidal] 🔓 Downgrading to LOW quality (AAC) to bypass DRM...`);
-          // Recursively call the function again, but force LOW quality
+          console.log(`[Tidal] 🔓 Downgrading to LOW quality to bypass DRM...`);
           return await getTidalStreamUrl(trackId, 'LOW');
         } else {
           throw new Error('Track is strictly DRM protected across all qualities.');
         }
       }
 
-      // If no DRM, return the playable URL
       if (manifestJson.urls && manifestJson.urls.length > 0) {
         return manifestJson.urls[0];
       }
     } catch (e) {
-      // Fallback regex if JSON parsing fails
+      console.warn(`[Tidal] Manifest parse failed, attempting fallback loop: ${e.message}`);
       const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
       if (urlMatch) return urlMatch[0];
     }
