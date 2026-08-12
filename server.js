@@ -10,7 +10,7 @@ app.use(cors());
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
-const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC;
+const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC; // New Spotify Cookie
 
 const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
@@ -500,25 +500,37 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Scoring helper to rank videos and aggressively punish live performances
-function getVideoScore(video, targetTitle) {
+// --- UPDATED VIDEO SCORING ENGINE ---
+function getVideoScore(video, targetTitle, targetArtist) {
   let score = 0;
+  // Combine title AND hidden version tag for grading!
   const vTitle = (video.title || '').toLowerCase();
+  const vVersion = (video.version || '').toLowerCase();
+  const fullString = `${vTitle} ${vVersion}`;
   const target = targetTitle.toLowerCase();
+  const artist = targetArtist.toLowerCase();
+  const vArtist = (video.artist?.name || video.artists?.[0]?.name || '').toLowerCase();
 
-  // 1. Point bonuses for matching the exact title
+  // 1. Artist Match Verification (+100 points or Huge Penalty)
+  if (vArtist && (vArtist.includes(artist) || artist.includes(vArtist))) {
+    score += 100;
+  } else {
+    score -= 200; 
+  }
+
+  // 2. Title Match Bonus
   if (vTitle === target) score += 100;
   else if (vTitle.includes(target)) score += 50;
   else if (target.includes(vTitle)) score += 20;
 
-  // 2. Point bonuses for explicit studio keywords
-  if (/\b(official|music video)\b/i.test(vTitle)) score += 30;
-  if (/\b(lyric|lyrics)\b/i.test(vTitle)) score += 15;
+  // 3. Official Keywords Bonus
+  if (/\b(official|music video)\b/i.test(fullString)) score += 30;
+  if (/\b(lyric|lyrics)\b/i.test(fullString)) score += 15;
 
-  // 3. MASSIVE penalty to drop live performances to the bottom
+  // 4. INSTANT KILL for Live / Unplugged performances (-500 points!)
   const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|live at)\b/i;
-  if (liveRegex.test(vTitle)) {
-    score -= 200;
+  if (liveRegex.test(fullString)) {
+    score -= 500; 
   }
 
   return score;
@@ -547,12 +559,16 @@ app.get('/api/search-video', async (req, res) => {
     let rawItems = searchData.videos?.items || searchData.items || [];
 
     if (!isExplicitlyLive) {
-      // Sort items so Official videos go to the top, and negative-scored Live videos drop to the bottom
-      rawItems.sort((a, b) => getVideoScore(b, q) - getVideoScore(a, q));
+      // Sort items so Official videos go to the top
+      rawItems.sort((a, b) => getVideoScore(b, q, '') - getVideoScore(a, q, ''));
       
       // Completely strip out any videos that still trigger the live penalty
       const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|live at)\b/i;
-      const studioVideos = rawItems.filter(v => !liveRegex.test(v.title || ''));
+      const studioVideos = rawItems.filter(v => {
+        const fullString = `${v.title || ''} ${v.version || ''}`;
+        return !liveRegex.test(fullString);
+      });
+
       if (studioVideos.length > 0) {
         rawItems = studioVideos;
       }
@@ -560,7 +576,8 @@ app.get('/api/search-video', async (req, res) => {
 
     const videos = rawItems.slice(0, 10).map((v) => ({
       id: v.id,
-      title: v.title,
+      // Pass the version down to the app so you can visibly see what was fetched
+      title: v.version ? `${v.title} (${v.version})` : v.title, 
       artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
       thumbnailUrl: v.imageId ? `https://resources.tidal.com/images/${v.imageId.replace(/-/g, '/')}/320x240.jpg` : null,
       duration: v.duration
@@ -615,13 +632,13 @@ app.get('/api/official-video', async (req, res) => {
     }
 
     // Use our new Scoring Engine to pick the absolute best Official Video
-    items.sort((a, b) => getVideoScore(b, title) - getVideoScore(a, title));
+    items.sort((a, b) => getVideoScore(b, title, artist) - getVideoScore(a, title, artist));
 
     const bestVideo = items[0];
-    const topScore = getVideoScore(bestVideo, title);
+    const topScore = getVideoScore(bestVideo, title, artist);
 
     // Guard Clause: If the top-scoring video STILL has a negative score, 
-    // it means ONLY live performances exist. We bravely refuse to return it.
+    // it means ONLY live performances exist on Tidal. We bravely refuse to return it.
     if (topScore < 0) {
       return res.json({ found: false, message: 'Only live performances exist on Tidal. Studio video unavailable.' });
     }
@@ -631,7 +648,7 @@ app.get('/api/official-video', async (req, res) => {
     res.json({
       found: true,
       videoId: bestVideo.id,
-      title: bestVideo.title,
+      title: bestVideo.version ? `${bestVideo.title} (${bestVideo.version})` : bestVideo.title,
       videoUrl: directStreamUrl
     });
   } catch (error) {
