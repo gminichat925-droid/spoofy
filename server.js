@@ -507,14 +507,21 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Video Search
+// Video Search (Filtered for Official/Studio Videos)
 app.get('/api/search-video', async (req, res) => {
   try {
     const { q } = req.query;
     if (!q) return res.status(400).json({ error: 'Search query required.' });
 
     const token = await getAccessToken();
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=10&types=VIDEOS&countryCode=US`;
+    
+    // Check if the user explicitly asked for a live performance
+    const isExplicitlyLive = /\b(live|performance|concert|festival|session|tour)\b/i.test(q);
+    
+    // Append "Official Video" to target music/lyric videos if not explicitly asking for live
+    const searchQuery = isExplicitlyLive ? q : `${q} Official Video`;
+
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=15&types=VIDEOS&countryCode=US`;
     
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
@@ -524,9 +531,18 @@ app.get('/api/search-video', async (req, res) => {
     if (!searchRes.ok) throw new Error('Video search request failed');
     
     const searchData = await searchRes.json();
-    const rawItems = searchData.videos?.items || searchData.items || [];
+    let rawItems = searchData.videos?.items || searchData.items || [];
 
-    const videos = rawItems.map((v) => ({
+    // Filter out live performances if not explicitly requested
+    if (!isExplicitlyLive) {
+      const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|vevo lift|live at)\b/i;
+      const studioVideos = rawItems.filter(v => !liveRegex.test(v.title || ''));
+      if (studioVideos.length > 0) {
+        rawItems = studioVideos;
+      }
+    }
+
+    const videos = rawItems.slice(0, 10).map((v) => ({
       id: v.id,
       title: v.title,
       artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
@@ -554,6 +570,49 @@ app.get('/api/video', async (req, res) => {
     });
   } catch (error) {
     console.error('Video Fetch Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Fetch Auto-Matched Official Video for a specific Track
+app.get('/api/official-video', async (req, res) => {
+  try {
+    const { title, artist } = req.query;
+    if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
+
+    const token = await getAccessToken();
+    const searchQuery = `${title} ${artist} Official Video`;
+    
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=10&types=VIDEOS&countryCode=US`;
+    const searchRes = await fetch(searchUrl, {
+      headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!searchRes.ok) throw new Error('Video search request failed');
+    const searchData = await searchRes.json();
+    const items = searchData.videos?.items || searchData.items || [];
+
+    const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal)\b/i;
+    
+    // First choice: Non-live video
+    let bestVideo = items.find(v => !liveRegex.test(v.title || ''));
+    // Fallback: First returned item
+    if (!bestVideo && items.length > 0) bestVideo = items[0];
+
+    if (!bestVideo) {
+      return res.json({ found: false, message: 'No official video found.' });
+    }
+
+    const directStreamUrl = await getTidalVideoStreamUrl(bestVideo.id);
+
+    res.json({
+      found: true,
+      videoId: bestVideo.id,
+      title: bestVideo.title,
+      videoUrl: directStreamUrl
+    });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
