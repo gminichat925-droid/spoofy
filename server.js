@@ -516,12 +516,10 @@ app.get('/api/search-video', async (req, res) => {
     const token = await getAccessToken();
     
     // Check if the user explicitly asked for a live performance
-    const isExplicitlyLive = /\b(live|performance|concert|festival|session|tour)\b/i.test(q);
+    const isExplicitlyLive = /\b(live|performance|concert|festival|session|tour|unplugged|acoustic)\b/i.test(q);
     
-    // Append "Official Video" to target music/lyric videos if not explicitly asking for live
-    const searchQuery = isExplicitlyLive ? q : `${q} Official Video`;
-
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=15&types=VIDEOS&countryCode=US`;
+    // Use the raw query. We don't append "Official Video" because Tidal uses strict track names.
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=15&types=VIDEOS&countryCode=US`;
     
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
@@ -535,7 +533,7 @@ app.get('/api/search-video', async (req, res) => {
 
     // Filter out live performances if not explicitly requested
     if (!isExplicitlyLive) {
-      const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|vevo lift|live at)\b/i;
+      const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|vevo lift|live at|acoustic)\b/i;
       const studioVideos = rawItems.filter(v => !liveRegex.test(v.title || ''));
       if (studioVideos.length > 0) {
         rawItems = studioVideos;
@@ -581,9 +579,11 @@ app.get('/api/official-video', async (req, res) => {
     if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
 
     const token = await getAccessToken();
-    const searchQuery = `${title} ${artist} Official Video`;
     
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=10&types=VIDEOS&countryCode=US`;
+    // Search strictly by Title and Artist so Tidal finds the exact studio video
+    const searchQuery = `${title} ${artist}`;
+    
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=15&types=VIDEOS&countryCode=US`;
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
       signal: AbortSignal.timeout(5000),
@@ -593,11 +593,22 @@ app.get('/api/official-video', async (req, res) => {
     const searchData = await searchRes.json();
     const items = searchData.videos?.items || searchData.items || [];
 
-    const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal)\b/i;
+    // Expanded Regex to catch MTV Unplugged and Acoustic versions
+    const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic)\b/i;
     
-    // First choice: Non-live video
-    let bestVideo = items.find(v => !liveRegex.test(v.title || ''));
-    // Fallback: First returned item
+    // 1. Strict Match: Non-live AND the title includes the exact song name
+    let bestVideo = items.find(v => {
+      const isLive = liveRegex.test(v.title || '');
+      const isTitleMatch = (v.title || '').toLowerCase().includes(title.toLowerCase());
+      return !isLive && isTitleMatch;
+    });
+
+    // 2. Fallback: Any Non-live video
+    if (!bestVideo) {
+      bestVideo = items.find(v => !liveRegex.test(v.title || ''));
+    }
+    
+    // 3. Last Resort: First returned item
     if (!bestVideo && items.length > 0) bestVideo = items[0];
 
     if (!bestVideo) {
