@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises'); // Added for safe stream handling
+const { spawn } = require('child_process'); // Added to handle FFmpeg transcoding
 const { Vibrant } = require('node-vibrant/node'); 
 
 const app = express();
@@ -526,7 +527,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Stream
+// Audio Stream - UPGRADED WITH FFMPEG TRANSCODING
 app.get('/api/stream', async (req, res) => {
   try {
     let { trackId, title, artist } = req.query;
@@ -538,47 +539,62 @@ app.get('/api/stream', async (req, res) => {
     }
 
     const directStreamUrl = await getTidalStreamUrl(trackId);
-    const clientRange = req.headers.range || 'bytes=0-';
+    
+    // 1. FLAC streams (LOSSLESS) can be piped directly to the browser natively
+    if (directStreamUrl.includes('.flac')) {
+      const clientRange = req.headers.range || 'bytes=0-';
+      const controller = new AbortController();
+      req.on('close', () => controller.abort());
 
-    // Hook an AbortController to the browser's connection
-    const controller = new AbortController();
+      const tidalResponse = await fetch(directStreamUrl, { 
+        headers: { 'Range': clientRange },
+        signal: controller.signal 
+      });
+      
+      if (!tidalResponse.ok && tidalResponse.status !== 206) return res.status(tidalResponse.status).json({ error: 'Tidal CDN request failed' });
+
+      res.status(tidalResponse.status);
+      ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach((h) => {
+        const val = tidalResponse.headers.get(h);
+        if (val) res.setHeader(h, val);
+      });
+      if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'audio/flac');
+      res.setHeader('Accept-Ranges', 'bytes');
+      
+      try {
+        await pipeline(Readable.fromWeb(tidalResponse.body), res);
+      } catch (err) {}
+      return;
+    }
+
+    // 2. AAC / DASH streams (HIGH/LOW) are Fragmented MP4s. 
+    // Browsers CANNOT play fMP4 natively, so we transcode it live into a standard MP3.
+    res.setHeader('Content-Type', 'audio/mpeg');
+    
+    const ffmpegProcess = spawn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-i', directStreamUrl,   // Let FFmpeg safely download the CDN URL directly
+      '-f', 'mp3',             // Output as MP3
+      '-c:a', 'libmp3lame',    // Standard MP3 audio codec
+      '-b:a', '128k',          // Lock bitrate to match LOW/HIGH stream quality
+      'pipe:1'                 // Pipe the output to stdout
+    ]);
+
+    // Pipe the transcoded audio directly to the browser
+    ffmpegProcess.stdout.pipe(res);
+
+    // Suppress background crash logs if the user skips a song
+    ffmpegProcess.on('error', () => {});
+    ffmpegProcess.stdout.on('error', () => {});
+    
+    // Kill the heavy FFmpeg process immediately if the user closes the tab or skips
     req.on('close', () => {
-      controller.abort(); // Kills the fetch if the user skips/scrubs or closes the browser
+      ffmpegProcess.kill('SIGKILL');
     });
 
-    const tidalResponse = await fetch(directStreamUrl, { 
-      headers: { 'Range': clientRange },
-      signal: controller.signal 
-    });
-    
-    if (!tidalResponse.ok && tidalResponse.status !== 206) return res.status(tidalResponse.status).json({ error: 'Tidal CDN request failed' });
-
-    res.status(tidalResponse.status);
-    ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach((h) => {
-      const val = tidalResponse.headers.get(h);
-      if (val) res.setHeader(h, val);
-    });
-
-    // Explicitly guarantee a content type if missing
-    if (!res.getHeader('content-type')) {
-      res.setHeader('Content-Type', directStreamUrl.includes('.flac') ? 'audio/flac' : 'audio/mp4');
-    }
-
-    res.setHeader('Accept-Ranges', 'bytes');
-    
-    // Safely pipeline the stream instead of standard .pipe()
-    try {
-      await pipeline(
-        Readable.fromWeb(tidalResponse.body),
-        res
-      );
-    } catch (err) {
-      // Ignore premature close errors (this is normal when a user scrubs the playhead)
-      if (err.code !== 'ERR_STREAM_PREMATURE_CLOSE' && err.name !== 'AbortError') {
-        console.error('Stream Pipeline Error:', err.message);
-      }
-    }
   } catch (error) {
+    console.error('[Stream Error]', error.message);
     if (!res.headersSent) res.status(500).json({ error: error.message });
   }
 });
