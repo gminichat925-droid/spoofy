@@ -53,10 +53,12 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
-// 2. Fetch Direct Stream URL from Tidal Manifest
-async function getTidalStreamUrl(trackId) {
+// 2. Fetch Direct Stream URL from Tidal Manifest (With DRM & Spatial Audio Bypass)
+async function getTidalStreamUrl(trackId, quality = 'HIGH') {
   const token = await getAccessToken();
-  const url = `https://api.tidal.com/v1/tracks/${trackId}/playbackinfopostpaywall?audioquality=HIGH&playbackmode=STREAM&assetpresentation=FULL`;
+  
+  // Added &audioMode=STEREO to prevent silent Dolby Atmos / 360 Reality Audio streams
+  const url = `https://api.tidal.com/v1/tracks/${trackId}/playbackinfopostpaywall?audioquality=${quality}&playbackmode=STREAM&assetpresentation=FULL&audioMode=STEREO`;
 
   const res = await fetch(url, {
     headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
@@ -68,14 +70,36 @@ async function getTidalStreamUrl(trackId) {
 
   if (data.manifest) {
     const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
+    
     try {
       const manifestJson = JSON.parse(decodedManifest);
-      if (manifestJson.urls && manifestJson.urls.length > 0) return manifestJson.urls[0];
+      
+      // 🚨 DRM CHECK: If the track is encrypted, we must downgrade to bypass it
+      const isDRM = manifestJson.encryptionType && manifestJson.encryptionType !== 'NONE';
+      
+      if (isDRM) {
+        console.warn(`[Tidal] 🔒 Track ${trackId} is DRM Protected at ${quality} quality.`);
+        
+        if (quality === 'HIGH') {
+          console.log(`[Tidal] 🔓 Downgrading to LOW quality (AAC) to bypass DRM...`);
+          // Recursively call the function again, but force LOW quality
+          return await getTidalStreamUrl(trackId, 'LOW');
+        } else {
+          throw new Error('Track is strictly DRM protected across all qualities.');
+        }
+      }
+
+      // If no DRM, return the playable URL
+      if (manifestJson.urls && manifestJson.urls.length > 0) {
+        return manifestJson.urls[0];
+      }
     } catch (e) {
+      // Fallback regex if JSON parsing fails
       const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
       if (urlMatch) return urlMatch[0];
     }
   }
+  
   throw new Error('No audio URL found in Tidal manifest.');
 }
 
