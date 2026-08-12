@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
+const { pipeline } = require('stream/promises'); // Added for safe stream handling
 const { Vibrant } = require('node-vibrant/node'); 
 
 const app = express();
@@ -54,7 +55,7 @@ async function getAccessToken() {
 }
 
 // 2. Fetch Direct Stream URL from Tidal Manifest (With Smart DASH & DRM Extraction)
-async function getTidalStreamUrl(trackId, quality = 'HIGH') {
+async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   const token = await getAccessToken();
   
   // Added &audioMode=STEREO to prevent silent Dolby Atmos streams
@@ -65,7 +66,13 @@ async function getTidalStreamUrl(trackId, quality = 'HIGH') {
     signal: AbortSignal.timeout(5000),
   });
 
-  if (!res.ok) throw new Error(`Tidal API playback info failed: ${res.status}`);
+  // Fallback safely if the API outright rejects the requested quality
+  if (!res.ok) {
+    if (quality === 'LOSSLESS') return await getTidalStreamUrl(trackId, 'HIGH');
+    if (quality === 'HIGH') return await getTidalStreamUrl(trackId, 'LOW');
+    throw new Error(`Tidal API playback info failed: ${res.status}`);
+  }
+
   const data = await res.json();
 
   if (data.manifest) {
@@ -76,7 +83,10 @@ async function getTidalStreamUrl(trackId, quality = 'HIGH') {
       // 1. Check if the DASH file contains DRM Encryption
       if (decodedManifest.includes('<ContentProtection')) {
         console.warn(`[Tidal] 🔒 DASH Track ${trackId} is DRM Protected at ${quality}.`);
-        if (quality === 'HIGH') {
+        if (quality === 'LOSSLESS') {
+          console.log(`[Tidal] 🔓 Downgrading to HIGH quality to bypass DRM...`);
+          return await getTidalStreamUrl(trackId, 'HIGH');
+        } else if (quality === 'HIGH') {
           console.log(`[Tidal] 🔓 Downgrading to LOW quality to bypass DRM...`);
           return await getTidalStreamUrl(trackId, 'LOW');
         } else {
@@ -84,10 +94,10 @@ async function getTidalStreamUrl(trackId, quality = 'HIGH') {
         }
       }
 
-      // 2. If no DRM, crack open the XML and extract the direct .mp4 audio link!
+      // 2. If no DRM, crack open the XML and extract the direct audio link!
       const baseUrlMatch = decodedManifest.match(/<BaseURL>(.+?)<\/BaseURL>/);
       if (baseUrlMatch && baseUrlMatch[1]) {
-        console.log(`[Tidal] ✅ Extracted direct audio file from DASH XML!`);
+        console.log(`[Tidal] ✅ Extracted direct audio file from DASH XML! (${quality})`);
         // XML escapes ampersands, so we must unescape them to get a valid URL
         return baseUrlMatch[1].replace(/&amp;/g, '&'); 
       }
@@ -100,7 +110,10 @@ async function getTidalStreamUrl(trackId, quality = 'HIGH') {
       const isDRM = manifestJson.encryptionType && manifestJson.encryptionType !== 'NONE';
       if (isDRM) {
         console.warn(`[Tidal] 🔒 JSON Track ${trackId} is DRM Protected at ${quality}.`);
-        if (quality === 'HIGH') {
+        if (quality === 'LOSSLESS') {
+          console.log(`[Tidal] 🔓 Downgrading to HIGH quality to bypass DRM...`);
+          return await getTidalStreamUrl(trackId, 'HIGH');
+        } else if (quality === 'HIGH') {
           console.log(`[Tidal] 🔓 Downgrading to LOW quality to bypass DRM...`);
           return await getTidalStreamUrl(trackId, 'LOW');
         } else {
@@ -109,7 +122,7 @@ async function getTidalStreamUrl(trackId, quality = 'HIGH') {
       }
 
       if (manifestJson.urls && manifestJson.urls.length > 0) {
-        console.log(`[Tidal] ✅ Extracted direct audio file from JSON!`);
+        console.log(`[Tidal] ✅ Extracted direct audio file from JSON! (${quality})`);
         return manifestJson.urls[0];
       }
     } catch (e) {
@@ -527,7 +540,17 @@ app.get('/api/stream', async (req, res) => {
     const directStreamUrl = await getTidalStreamUrl(trackId);
     const clientRange = req.headers.range || 'bytes=0-';
 
-    const tidalResponse = await fetch(directStreamUrl, { headers: { 'Range': clientRange } });
+    // Hook an AbortController to the browser's connection
+    const controller = new AbortController();
+    req.on('close', () => {
+      controller.abort(); // Kills the fetch if the user skips/scrubs or closes the browser
+    });
+
+    const tidalResponse = await fetch(directStreamUrl, { 
+      headers: { 'Range': clientRange },
+      signal: controller.signal 
+    });
+    
     if (!tidalResponse.ok && tidalResponse.status !== 206) return res.status(tidalResponse.status).json({ error: 'Tidal CDN request failed' });
 
     res.status(tidalResponse.status);
@@ -536,8 +559,25 @@ app.get('/api/stream', async (req, res) => {
       if (val) res.setHeader(h, val);
     });
 
+    // Explicitly guarantee a content type if missing
+    if (!res.getHeader('content-type')) {
+      res.setHeader('Content-Type', directStreamUrl.includes('.flac') ? 'audio/flac' : 'audio/mp4');
+    }
+
     res.setHeader('Accept-Ranges', 'bytes');
-    Readable.fromWeb(tidalResponse.body).pipe(res);
+    
+    // Safely pipeline the stream instead of standard .pipe()
+    try {
+      await pipeline(
+        Readable.fromWeb(tidalResponse.body),
+        res
+      );
+    } catch (err) {
+      // Ignore premature close errors (this is normal when a user scrubs the playhead)
+      if (err.code !== 'ERR_STREAM_PREMATURE_CLOSE' && err.name !== 'AbortError') {
+        console.error('Stream Pipeline Error:', err.message);
+      }
+    }
   } catch (error) {
     if (!res.headersSent) res.status(500).json({ error: error.message });
   }
