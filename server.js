@@ -81,7 +81,6 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
     
     // 🚨 SCENARIO A: Tidal sent a DASH XML Playlist
     if (data.manifestMimeType === 'application/dash+xml') {
-      // 1. Check if the DASH file contains DRM Encryption
       if (decodedManifest.includes('<ContentProtection')) {
         console.warn(`[Tidal] 🔒 DASH Track ${trackId} is DRM Protected at ${quality}.`);
         if (quality === 'LOSSLESS') {
@@ -95,11 +94,9 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
         }
       }
 
-      // 2. If no DRM, crack open the XML and extract the direct audio link!
       const baseUrlMatch = decodedManifest.match(/<BaseURL>(.+?)<\/BaseURL>/);
       if (baseUrlMatch && baseUrlMatch[1]) {
         console.log(`[Tidal] ✅ Extracted direct audio file from DASH XML! (${quality})`);
-        // XML escapes ampersands, so we must unescape them to get a valid URL
         return baseUrlMatch[1].replace(/&amp;/g, '&'); 
       }
     }
@@ -127,7 +124,6 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
         return manifestJson.urls[0];
       }
     } catch (e) {
-      // Fallback regex if it's neither standard DASH nor JSON
       const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
       if (urlMatch) return urlMatch[0].replace(/&amp;/g, '&');
     }
@@ -491,6 +487,50 @@ async function getLrclibLyrics(title, artist) {
   return null;
 }
 
+// --- UPDATED VIDEO SCORING ENGINE ---
+function getVideoScore(video, targetTitle, targetArtist) {
+  let score = 0;
+  const vTitle = (video.title || '').toLowerCase();
+  const vVersion = (video.version || '').toLowerCase();
+  const fullString = `${vTitle} ${vVersion}`;
+  const target = targetTitle.toLowerCase();
+  const artist = targetArtist.toLowerCase();
+  const vArtist = (video.artist?.name || video.artists?.[0]?.name || '').toLowerCase();
+
+  if (vArtist && (vArtist.includes(artist) || artist.includes(vArtist))) {
+    score += 100;
+  } else {
+    score -= 200; 
+  }
+
+  if (vTitle === target) score += 100;
+  else if (vTitle.includes(target)) score += 50;
+  else if (target.includes(vTitle)) score += 20;
+
+  if (/\b(official|music video)\b/i.test(fullString)) score += 30;
+  if (/\b(lyric|lyrics)\b/i.test(fullString)) score += 15;
+
+  const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|live at)\b/i;
+  if (liveRegex.test(fullString)) {
+    score -= 500; 
+  }
+
+  return score;
+}
+
+// Offset Calculator Helper (Calculates Video Intro Delay)
+function calculateVideoOffset(videoDuration, audioDuration) {
+  if (!videoDuration || !audioDuration) return 0;
+  const vDur = Number(videoDuration);
+  const aDur = Number(audioDuration);
+
+  // If video is longer than audio track by >2 seconds, offset is intro delay
+  if (vDur > aDur && (vDur - aDur) >= 2) {
+    return Number((vDur - aDur).toFixed(2));
+  }
+  return 0;
+}
+
 // --- ENDPOINTS ---
 
 app.get('/', (req, res) => {
@@ -519,6 +559,7 @@ app.get('/api/search', async (req, res) => {
       artist: t.artist?.name || t.artists?.[0]?.name || 'Unknown Artist',
       album: t.album?.title || 'Unknown Album',
       coverUrl: t.album?.cover ? `https://resources.tidal.com/images/${t.album.cover.replace(/-/g, '/')}/320x320.jpg` : null,
+      duration: t.duration || 0,
     }));
 
     res.json({ tracks });
@@ -527,7 +568,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Stream - UPGRADED WITH FFMPEG TRANSCODING
+// Audio Stream
 app.get('/api/stream', async (req, res) => {
   try {
     let { trackId, title, artist } = req.query;
@@ -540,7 +581,6 @@ app.get('/api/stream', async (req, res) => {
 
     const directStreamUrl = await getTidalStreamUrl(trackId);
     
-    // 1. FLAC streams (LOSSLESS) can be piped directly to the browser natively
     if (directStreamUrl.includes('.flac')) {
       const clientRange = req.headers.range || 'bytes=0-';
       const controller = new AbortController();
@@ -567,28 +607,23 @@ app.get('/api/stream', async (req, res) => {
       return;
     }
 
-    // 2. AAC / DASH streams (HIGH/LOW) are Fragmented MP4s. 
-    // Browsers CANNOT play fMP4 natively, so we transcode it live into a standard MP3.
     res.setHeader('Content-Type', 'audio/mpeg');
     
     const ffmpegProcess = spawn('ffmpeg', [
       '-hide_banner',
       '-loglevel', 'error',
-      '-i', directStreamUrl,   // Let FFmpeg safely download the CDN URL directly
-      '-f', 'mp3',             // Output as MP3
-      '-c:a', 'libmp3lame',    // Standard MP3 audio codec
-      '-b:a', '128k',          // Lock bitrate to match LOW/HIGH stream quality
-      'pipe:1'                 // Pipe the output to stdout
+      '-i', directStreamUrl,
+      '-f', 'mp3',
+      '-c:a', 'libmp3lame',
+      '-b:a', '128k',
+      'pipe:1'
     ]);
 
-    // Pipe the transcoded audio directly to the browser
     ffmpegProcess.stdout.pipe(res);
 
-    // Suppress background crash logs if the user skips a song
     ffmpegProcess.on('error', () => {});
     ffmpegProcess.stdout.on('error', () => {});
     
-    // Kill the heavy FFmpeg process immediately if the user closes the tab or skips
     req.on('close', () => {
       ffmpegProcess.kill('SIGKILL');
     });
@@ -599,52 +634,15 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// --- UPDATED VIDEO SCORING ENGINE ---
-function getVideoScore(video, targetTitle, targetArtist) {
-  let score = 0;
-  // Combine title AND hidden version tag for grading!
-  const vTitle = (video.title || '').toLowerCase();
-  const vVersion = (video.version || '').toLowerCase();
-  const fullString = `${vTitle} ${vVersion}`;
-  const target = targetTitle.toLowerCase();
-  const artist = targetArtist.toLowerCase();
-  const vArtist = (video.artist?.name || video.artists?.[0]?.name || '').toLowerCase();
-
-  // 1. Artist Match Verification (+100 points or Huge Penalty)
-  if (vArtist && (vArtist.includes(artist) || artist.includes(vArtist))) {
-    score += 100;
-  } else {
-    score -= 200; 
-  }
-
-  // 2. Title Match Bonus
-  if (vTitle === target) score += 100;
-  else if (vTitle.includes(target)) score += 50;
-  else if (target.includes(vTitle)) score += 20;
-
-  // 3. Official Keywords Bonus
-  if (/\b(official|music video)\b/i.test(fullString)) score += 30;
-  if (/\b(lyric|lyrics)\b/i.test(fullString)) score += 15;
-
-  // 4. INSTANT KILL for Live / Unplugged performances (-500 points!)
-  const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|live at)\b/i;
-  if (liveRegex.test(fullString)) {
-    score -= 500; 
-  }
-
-  return score;
-}
-
-// Video Search (Filtered and Ranked for Studio Videos)
+// Video Search (Filtered, Ranked, and Injected with Video Intro Offset)
 app.get('/api/search-video', async (req, res) => {
   try {
-    const { q } = req.query;
+    const { q, duration } = req.query;
     if (!q) return res.status(400).json({ error: 'Search query required.' });
 
     const token = await getAccessToken();
     const isExplicitlyLive = /\b(live|performance|concert|festival|session|tour|unplugged|acoustic)\b/i.test(q);
     
-    // Increased limit to 30 to dig deeper for buried official videos
     const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=30&types=VIDEOS&countryCode=US`;
     
     const searchRes = await fetch(searchUrl, {
@@ -658,10 +656,8 @@ app.get('/api/search-video', async (req, res) => {
     let rawItems = searchData.videos?.items || searchData.items || [];
 
     if (!isExplicitlyLive) {
-      // Sort items so Official videos go to the top
       rawItems.sort((a, b) => getVideoScore(b, q, '') - getVideoScore(a, q, ''));
       
-      // Completely strip out any videos that still trigger the live penalty
       const liveRegex = /\b(live|performance|concert|festival|session|tour|unplugged|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|live at)\b/i;
       const studioVideos = rawItems.filter(v => {
         const fullString = `${v.title || ''} ${v.version || ''}`;
@@ -673,14 +669,17 @@ app.get('/api/search-video', async (req, res) => {
       }
     }
 
-    const videos = rawItems.slice(0, 10).map((v) => ({
-      id: v.id,
-      // Pass the version down to the app so you can visibly see what was fetched
-      title: v.version ? `${v.title} (${v.version})` : v.title, 
-      artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
-      thumbnailUrl: v.imageId ? `https://resources.tidal.com/images/${v.imageId.replace(/-/g, '/')}/320x240.jpg` : null,
-      duration: v.duration
-    }));
+    const videos = rawItems.slice(0, 10).map((v) => {
+      const startOffset = calculateVideoOffset(v.duration, duration);
+      return {
+        id: v.id,
+        title: v.version ? `${v.title} (${v.version})` : v.title, 
+        artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
+        thumbnailUrl: v.imageId ? `https://resources.tidal.com/images/${v.imageId.replace(/-/g, '/')}/320x240.jpg` : null,
+        duration: v.duration,
+        startOffset: startOffset, // Automatically returned offset in seconds
+      };
+    });
 
     res.json({ videos });
   } catch (error) {
@@ -709,13 +708,12 @@ app.get('/api/video', async (req, res) => {
 // Fetch Auto-Matched Official Video for a specific Track
 app.get('/api/official-video', async (req, res) => {
   try {
-    const { title, artist } = req.query;
+    const { title, artist, duration } = req.query;
     if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
 
     const token = await getAccessToken();
     const searchQuery = `${title} ${artist}`;
     
-    // Digging up to 30 items deep to bypass popular live performances
     const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=30&types=VIDEOS&countryCode=US`;
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
@@ -730,24 +728,24 @@ app.get('/api/official-video', async (req, res) => {
       return res.json({ found: false, message: 'No videos found for this track.' });
     }
 
-    // Use our new Scoring Engine to pick the absolute best Official Video
     items.sort((a, b) => getVideoScore(b, title, artist) - getVideoScore(a, title, artist));
 
     const bestVideo = items[0];
     const topScore = getVideoScore(bestVideo, title, artist);
 
-    // Guard Clause: If the top-scoring video STILL has a negative score, 
-    // it means ONLY live performances exist on Tidal. We bravely refuse to return it.
     if (topScore < 0) {
       return res.json({ found: false, message: 'Only live performances exist on Tidal. Studio video unavailable.' });
     }
 
+    const startOffset = calculateVideoOffset(bestVideo.duration, duration);
     const directStreamUrl = await getTidalVideoStreamUrl(bestVideo.id);
 
     res.json({
       found: true,
       videoId: bestVideo.id,
       title: bestVideo.version ? `${bestVideo.title} (${bestVideo.version})` : bestVideo.title,
+      duration: bestVideo.duration,
+      startOffset: startOffset, // Automatically returned offset in seconds
       videoUrl: directStreamUrl
     });
   } catch (error) {
@@ -755,7 +753,7 @@ app.get('/api/official-video', async (req, res) => {
   }
 });
 
-// Apple Motion & Color Endpoint (Safe Timeout Implementation)
+// Apple Motion & Color Endpoint
 app.get('/api/motion', async (req, res) => {
   try {
     const { album, artist, coverUrl } = req.query;
@@ -769,7 +767,6 @@ app.get('/api/motion', async (req, res) => {
       } catch (e) {}
     }
 
-    // Force resolve to null if scraping takes longer than 3.5 seconds
     const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), 3500));
     const motionUrl = await Promise.race([ getAppleMotionUrl(album, artist), timeoutPromise ]);
 
