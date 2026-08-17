@@ -1,8 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
-const { pipeline } = require('stream/promises'); // Added for safe stream handling
-const { spawn } = require('child_process'); // Added to handle FFmpeg transcoding
+const { pipeline } = require('stream/promises');
+const { spawn } = require('child_process');
 const { Vibrant } = require('node-vibrant/node'); 
 
 const app = express();
@@ -12,7 +12,7 @@ app.use(cors());
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
-const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC; // New Spotify Cookie
+const SPOTIFY_SP_DC = process.env.SPOTIFY_SP_DC;
 
 const BASIC_AUTH = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
 
@@ -25,6 +25,9 @@ let lastAppleTokenAttempt = 0;
 
 let cachedSpotifyToken = null;
 let spotifyTokenExpiresAt = 0;
+
+// In-Memory Offset Cache (Track Name + Artist -> Intro Offset in seconds)
+const videoOffsetCache = new Map();
 
 // 1. Refresh Tidal Access Token
 async function getAccessToken() {
@@ -55,11 +58,9 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
-// 2. Fetch Direct Stream URL from Tidal Manifest (With Smart DASH & DRM Extraction)
+// 2. Fetch Direct Stream URL from Tidal Manifest
 async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   const token = await getAccessToken();
-  
-  // Added &audioMode=STEREO to prevent silent Dolby Atmos streams
   const url = `https://api.tidal.com/v1/tracks/${trackId}/playbackinfopostpaywall?audioquality=${quality}&playbackmode=STREAM&assetpresentation=FULL&audioMode=STEREO`;
 
   const res = await fetch(url, {
@@ -67,7 +68,6 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
     signal: AbortSignal.timeout(5000),
   });
 
-  // Fallback safely if the API outright rejects the requested quality
   if (!res.ok) {
     if (quality === 'LOSSLESS') return await getTidalStreamUrl(trackId, 'HIGH');
     if (quality === 'HIGH') return await getTidalStreamUrl(trackId, 'LOW');
@@ -79,48 +79,32 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   if (data.manifest) {
     const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
     
-    // 🚨 SCENARIO A: Tidal sent a DASH XML Playlist
+    // DASH XML
     if (data.manifestMimeType === 'application/dash+xml') {
       if (decodedManifest.includes('<ContentProtection')) {
         console.warn(`[Tidal] 🔒 DASH Track ${trackId} is DRM Protected at ${quality}.`);
-        if (quality === 'LOSSLESS') {
-          console.log(`[Tidal] 🔓 Downgrading to HIGH quality to bypass DRM...`);
-          return await getTidalStreamUrl(trackId, 'HIGH');
-        } else if (quality === 'HIGH') {
-          console.log(`[Tidal] 🔓 Downgrading to LOW quality to bypass DRM...`);
-          return await getTidalStreamUrl(trackId, 'LOW');
-        } else {
-          throw new Error('Track is strictly DRM protected across all qualities.');
-        }
+        if (quality === 'LOSSLESS') return await getTidalStreamUrl(trackId, 'HIGH');
+        if (quality === 'HIGH') return await getTidalStreamUrl(trackId, 'LOW');
+        throw new Error('Track is strictly DRM protected across all qualities.');
       }
 
       const baseUrlMatch = decodedManifest.match(/<BaseURL>(.+?)<\/BaseURL>/);
       if (baseUrlMatch && baseUrlMatch[1]) {
-        console.log(`[Tidal] ✅ Extracted direct audio file from DASH XML! (${quality})`);
         return baseUrlMatch[1].replace(/&amp;/g, '&'); 
       }
     }
 
-    // 🚨 SCENARIO B: Tidal sent a standard JSON Manifest
+    // JSON Manifest
     try {
       const manifestJson = JSON.parse(decodedManifest);
-      
       const isDRM = manifestJson.encryptionType && manifestJson.encryptionType !== 'NONE';
       if (isDRM) {
-        console.warn(`[Tidal] 🔒 JSON Track ${trackId} is DRM Protected at ${quality}.`);
-        if (quality === 'LOSSLESS') {
-          console.log(`[Tidal] 🔓 Downgrading to HIGH quality to bypass DRM...`);
-          return await getTidalStreamUrl(trackId, 'HIGH');
-        } else if (quality === 'HIGH') {
-          console.log(`[Tidal] 🔓 Downgrading to LOW quality to bypass DRM...`);
-          return await getTidalStreamUrl(trackId, 'LOW');
-        } else {
-          throw new Error('Track is strictly DRM protected across all qualities.');
-        }
+        if (quality === 'LOSSLESS') return await getTidalStreamUrl(trackId, 'HIGH');
+        if (quality === 'HIGH') return await getTidalStreamUrl(trackId, 'LOW');
+        throw new Error('Track is strictly DRM protected across all qualities.');
       }
 
       if (manifestJson.urls && manifestJson.urls.length > 0) {
-        console.log(`[Tidal] ✅ Extracted direct audio file from JSON! (${quality})`);
         return manifestJson.urls[0];
       }
     } catch (e) {
@@ -157,7 +141,6 @@ async function searchTidalForTrack(title, artist) {
 // 2.6 Fetch Direct Stream URL for Music Videos
 async function getTidalVideoStreamUrl(videoId) {
   const token = await getAccessToken();
-
   const url = `https://api.tidal.com/v1/videos/${videoId}/playbackinfopostpaywall?videoquality=HIGH&playbackmode=STREAM&assetpresentation=FULL`;
 
   const res = await fetch(url, {
@@ -192,7 +175,97 @@ async function getTidalVideoStreamUrl(videoId) {
   throw new Error('No video URL found in Tidal manifest.');
 }
 
-// 3. Ultra-Fast Apple Music Developer Token Scraper
+// ─────────────────────────────────────────────────────────────
+// 3. SMART OFFSET ENGINE (SPONSORBLOCK + DURATION CORRELATION)
+// ─────────────────────────────────────────────────────────────
+
+// Fast scraper to find the YouTube Video ID for SponsorBlock lookup
+async function getYouTubeVideoId(title, artist) {
+  try {
+    const query = encodeURIComponent(`${title} ${artist} official music video`);
+    const searchUrl = `https://www.youtube.com/results?search_query=${query}`;
+    
+    const res = await fetch(searchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      signal: AbortSignal.timeout(3000),
+    });
+
+    if (!res.ok) return null;
+    const html = await res.text();
+    
+    // Extract first standard 11-char YouTube video ID
+    const match = html.match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
+    return match ? match[1] : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// SponsorBlock Segment Lookup for Music Video Intro Skits/Dialogue
+async function getSponsorBlockIntroOffset(ytVideoId) {
+  try {
+    const url = `https://sponsor.ajay.app/api/skipSegments?videoID=${ytVideoId}&categories=["music_offtopic"]`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return null;
+
+    const segments = await res.json();
+    if (Array.isArray(segments)) {
+      // Find intro segment that begins at or near the start (t <= 3s)
+      const intro = segments.find(s => Array.isArray(s.segment) && s.segment[0] <= 3);
+      if (intro && intro.segment[1] > 2) {
+        return Number(intro.segment[1].toFixed(2));
+      }
+    }
+  } catch (err) {}
+  return null;
+}
+
+// Master Function: Accurate Video Intro Offset
+async function getAccurateVideoIntroOffset(title, artist, videoDuration, audioDuration) {
+  const cacheKey = `${(title || '').toLowerCase()}|${(artist || '').toLowerCase()}`;
+  if (videoOffsetCache.has(cacheKey)) {
+    return videoOffsetCache.get(cacheKey);
+  }
+
+  // Normalize duration units to seconds
+  const vDur = Number(videoDuration > 10000 ? videoDuration / 1000 : videoDuration) || 0;
+  const aDur = Number(audioDuration > 10000 ? audioDuration / 1000 : audioDuration) || 0;
+
+  let calculatedOffset = 0;
+
+  // Tier 1: Check SponsorBlock Crowdsourced Database
+  try {
+    const ytVideoId = await getYouTubeVideoId(title, artist);
+    if (ytVideoId) {
+      const sbOffset = await getSponsorBlockIntroOffset(ytVideoId);
+      if (sbOffset !== null && sbOffset > 0) {
+        console.log(`[Smart Sync] 🎯 SponsorBlock intro offset found for "${title}": ${sbOffset}s`);
+        calculatedOffset = sbOffset;
+      }
+    }
+  } catch (e) {}
+
+  // Tier 2: Duration Delta Fallback
+  if (calculatedOffset === 0 && vDur > 0 && aDur > 0) {
+    const delta = vDur - aDur;
+    // If video is longer by >= 3 seconds, assume intro delay
+    if (delta >= 3) {
+      calculatedOffset = Number(delta.toFixed(2));
+      console.log(`[Smart Sync] ⏱️ Calculated duration delta offset for "${title}": ${calculatedOffset}s`);
+    }
+  }
+
+  // Cache and return
+  videoOffsetCache.set(cacheKey, calculatedOffset);
+  return calculatedOffset;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 4. APPLE MOTION SCRAPER
+// ─────────────────────────────────────────────────────────────
 async function getAppleDeveloperToken() {
   if (cachedAppleToken && Date.now() < appleTokenExpiresAt) return cachedAppleToken;
   if (Date.now() - lastAppleTokenAttempt < 10 * 60 * 1000) return null; 
@@ -200,7 +273,6 @@ async function getAppleDeveloperToken() {
   lastAppleTokenAttempt = Date.now();
 
   try {
-    console.log('[Apple Motion] Fetching live Apple Music developer token...');
     const res = await fetch('https://music.apple.com/us/browse', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15'
@@ -220,7 +292,6 @@ async function getAppleDeveloperToken() {
         if (tokenEnd !== -1) {
           cachedAppleToken = html.substring(tokenStart, tokenEnd);
           appleTokenExpiresAt = Date.now() + 12 * 60 * 60 * 1000;
-          console.log('[Apple Motion] ✅ Token scraped rapidly from meta tag!');
           return cachedAppleToken;
         }
       }
@@ -242,7 +313,6 @@ async function getAppleDeveloperToken() {
             if (match) {
               cachedAppleToken = match[0];
               appleTokenExpiresAt = Date.now() + 12 * 60 * 60 * 1000;
-              console.log('[Apple Motion] ✅ Token scraped rapidly from JS bundle!');
               return cachedAppleToken;
             }
           }
@@ -250,13 +320,12 @@ async function getAppleDeveloperToken() {
       }
     }
   } catch (err) {
-    console.warn(`[Apple Motion] Failed to scrape Apple token: ${err.message}`);
+    console.warn(`[Apple Motion] Scrape error: ${err.message}`);
   }
 
   return null;
 }
 
-// 4. Apple Motion Extractors
 function findTallVideoInJson(obj) {
   if (!obj || typeof obj !== 'object') return null;
   const target = obj.motionDetailTall || obj.motionTall;
@@ -325,16 +394,11 @@ async function getAppleMotionUrl(albumTitle, artistName) {
           if (detailRes.ok) {
             const detailData = await detailRes.json();
             const tallUrl = findTallVideoInJson(detailData);
-            if (tallUrl) {
-              console.log('[Apple Motion] ✅ Found TALL video via Amp API!');
-              return tallUrl;
-            }
+            if (tallUrl) return tallUrl;
           }
         }
       }
-    } catch (err) {
-      console.warn(`[Apple Motion] Engine 1 API error/timeout: ${err.message}`);
-    }
+    } catch (err) {}
   }
 
   try {
@@ -353,20 +417,15 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
     if (!pageRes.ok) return null;
     const html = await pageRes.text();
-
-    const htmlSlicedUrl = extractTallUrlFromRawString(html);
-    if (htmlSlicedUrl) {
-       console.log('[Apple Motion] ✅ Found TALL video via fast HTML Slice!');
-       return htmlSlicedUrl;
-    }
-  } catch (err) {
-    console.warn(`[Apple Motion] Engine 2 Web error/timeout: ${err.message}`);
-  }
+    return extractTallUrlFromRawString(html);
+  } catch (err) {}
 
   return null;
 }
 
-// 5. Spotify internal Lyrics Engine
+// ─────────────────────────────────────────────────────────────
+// 5. SPOTIFY & LRCLIB LYRICS ENGINE
+// ─────────────────────────────────────────────────────────────
 async function getSpotifyToken() {
   if (!SPOTIFY_SP_DC) return null;
   if (cachedSpotifyToken && Date.now() < spotifyTokenExpiresAt) return cachedSpotifyToken;
@@ -377,7 +436,6 @@ async function getSpotifyToken() {
       'Cookie': `sp_dc=${cleanCookie}`,
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
     };
 
     const res = await fetch('https://open.spotify.com/', { headers, signal: AbortSignal.timeout(5000) });
@@ -385,18 +443,14 @@ async function getSpotifyToken() {
 
     const sessionMatch = html.match(/<script id="session"[^>]*>([^<]+)<\/script>/);
     if (sessionMatch && sessionMatch[1]) {
-      try {
-        const sessionData = JSON.parse(sessionMatch[1]);
-        if (!sessionData.isAnonymous) {
-          cachedSpotifyToken = sessionData.accessToken;
-          spotifyTokenExpiresAt = sessionData.accessTokenExpirationTimestampMs - 60000;
-          return cachedSpotifyToken;
-        }
-      } catch (e) { /* ignore */ }
+      const sessionData = JSON.parse(sessionMatch[1]);
+      if (!sessionData.isAnonymous) {
+        cachedSpotifyToken = sessionData.accessToken;
+        spotifyTokenExpiresAt = sessionData.accessTokenExpirationTimestampMs - 60000;
+        return cachedSpotifyToken;
+      }
     }
-  } catch (e) {
-    console.warn('[Spotify] Fetch error:', e.message);
-  }
+  } catch (e) {}
   return null;
 }
 
@@ -460,7 +514,6 @@ async function getSpotifyLyrics(title, artist) {
   }
 }
 
-// 6. Fallback LRCLIB Lyrics Engine
 async function getLrclibLyrics(title, artist) {
   try {
     const searchUrl = new URL('https://lrclib.net/api/search');
@@ -487,7 +540,9 @@ async function getLrclibLyrics(title, artist) {
   return null;
 }
 
-// --- UPDATED VIDEO SCORING ENGINE ---
+// ─────────────────────────────────────────────────────────────
+// 6. VIDEO SCORING ENGINE
+// ─────────────────────────────────────────────────────────────
 function getVideoScore(video, targetTitle, targetArtist) {
   let score = 0;
   const vTitle = (video.title || '').toLowerCase();
@@ -518,20 +573,9 @@ function getVideoScore(video, targetTitle, targetArtist) {
   return score;
 }
 
-// Offset Calculator Helper (Calculates Video Intro Delay)
-function calculateVideoOffset(videoDuration, audioDuration) {
-  if (!videoDuration || !audioDuration) return 0;
-  const vDur = Number(videoDuration);
-  const aDur = Number(audioDuration);
-
-  // If video is longer than audio track by >2 seconds, offset is intro delay
-  if (vDur > aDur && (vDur - aDur) >= 2) {
-    return Number((vDur - aDur).toFixed(2));
-  }
-  return 0;
-}
-
-// --- ENDPOINTS ---
+// ─────────────────────────────────────────────────────────────
+// 7. API ENDPOINTS
+// ─────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.json({ status: 'online' });
@@ -568,7 +612,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Stream
+// Audio Stream (FLAC Native / AAC fMP4 Transcoded to MP3)
 app.get('/api/stream', async (req, res) => {
   try {
     let { trackId, title, artist } = req.query;
@@ -634,7 +678,7 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Video Search (Filtered, Ranked, and Injected with Video Intro Offset)
+// Video Search (Filtered, Ranked, and Injected with Smart Intro Offset)
 app.get('/api/search-video', async (req, res) => {
   try {
     const { q, duration } = req.query;
@@ -644,7 +688,6 @@ app.get('/api/search-video', async (req, res) => {
     const isExplicitlyLive = /\b(live|performance|concert|festival|session|tour|unplugged|acoustic)\b/i.test(q);
     
     const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=30&types=VIDEOS&countryCode=US`;
-    
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
       signal: AbortSignal.timeout(5000),
@@ -669,17 +712,17 @@ app.get('/api/search-video', async (req, res) => {
       }
     }
 
-    const videos = rawItems.slice(0, 10).map((v) => {
-      const startOffset = calculateVideoOffset(v.duration, duration);
-      return {
-        id: v.id,
-        title: v.version ? `${v.title} (${v.version})` : v.title, 
-        artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
-        thumbnailUrl: v.imageId ? `https://resources.tidal.com/images/${v.imageId.replace(/-/g, '/')}/320x240.jpg` : null,
-        duration: v.duration,
-        startOffset: startOffset, // Automatically returned offset in seconds
-      };
-    });
+    const firstVideo = rawItems[0];
+    const sharedOffset = firstVideo ? await getAccurateVideoIntroOffset(firstVideo.title, firstVideo.artist?.name || '', firstVideo.duration, duration) : 0;
+
+    const videos = rawItems.slice(0, 10).map((v) => ({
+      id: v.id,
+      title: v.version ? `${v.title} (${v.version})` : v.title, 
+      artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
+      thumbnailUrl: v.imageId ? `https://resources.tidal.com/images/${v.imageId.replace(/-/g, '/')}/320x240.jpg` : null,
+      duration: v.duration,
+      startOffset: sharedOffset,
+    }));
 
     res.json({ videos });
   } catch (error) {
@@ -687,25 +730,20 @@ app.get('/api/search-video', async (req, res) => {
   }
 });
 
-// Get Video Stream URL (Returns .m3u8 CDN link)
+// Get Video Stream URL (.m3u8 CDN link)
 app.get('/api/video', async (req, res) => {
   try {
     const { videoId } = req.query;
     if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
     const directStreamUrl = await getTidalVideoStreamUrl(videoId);
-
-    res.json({
-      success: true,
-      videoUrl: directStreamUrl
-    });
+    res.json({ success: true, videoUrl: directStreamUrl });
   } catch (error) {
-    console.error('Video Fetch Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Fetch Auto-Matched Official Video for a specific Track
+// Official Matched Music Video with Accurate Intro Offset
 app.get('/api/official-video', async (req, res) => {
   try {
     const { title, artist, duration } = req.query;
@@ -737,7 +775,8 @@ app.get('/api/official-video', async (req, res) => {
       return res.json({ found: false, message: 'Only live performances exist on Tidal. Studio video unavailable.' });
     }
 
-    const startOffset = calculateVideoOffset(bestVideo.duration, duration);
+    // Get SponsorBlock/Delta accurate intro offset
+    const startOffset = await getAccurateVideoIntroOffset(title, artist, bestVideo.duration, duration);
     const directStreamUrl = await getTidalVideoStreamUrl(bestVideo.id);
 
     res.json({
@@ -745,7 +784,7 @@ app.get('/api/official-video', async (req, res) => {
       videoId: bestVideo.id,
       title: bestVideo.version ? `${bestVideo.title} (${bestVideo.version})` : bestVideo.title,
       duration: bestVideo.duration,
-      startOffset: startOffset, // Automatically returned offset in seconds
+      startOffset: startOffset,
       videoUrl: directStreamUrl
     });
   } catch (error) {
@@ -753,7 +792,7 @@ app.get('/api/official-video', async (req, res) => {
   }
 });
 
-// Apple Motion & Color Endpoint
+// Apple Motion & Color
 app.get('/api/motion', async (req, res) => {
   try {
     const { album, artist, coverUrl } = req.query;
@@ -780,6 +819,7 @@ app.get('/api/motion', async (req, res) => {
   }
 });
 
+// Lyrics Endpoint
 app.get('/api/lyrics', async (req, res) => {
   try {
     const { title, artist } = req.query;
