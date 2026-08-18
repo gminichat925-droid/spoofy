@@ -141,7 +141,7 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. YT-DLP DIRECT STREAM & SUBTITLE EXTRACTOR
+// 2. YT-DLP DIRECT STREAM EXTRACTOR
 // ─────────────────────────────────────────────────────────────
 
 function getStreamUrlFromYtDlp(videoId) {
@@ -200,12 +200,15 @@ async function resolveDirectYouTubeStream(videoId) {
   return null;
 }
 
-// Parse WebVTT content into clean, timed cue objects
-function parseVttToCues(vttText) {
+// ─────────────────────────────────────────────────────────────
+// 3. POSITIONAL VTT PARSER (SPECIAL TOP/LEFT/RIGHT POSITIONING)
+// ─────────────────────────────────────────────────────────────
+
+function parseVttToPositionalCues(vttText) {
   if (!vttText) return [];
   const lines = vttText.replace(/\r\n/g, '\n').split('\n');
   const cues = [];
-  const timeRegex = /(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})/;
+  const timeRegex = /(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})(.*)/;
 
   let currentCue = null;
 
@@ -215,6 +218,7 @@ function parseVttToCues(vttText) {
       if (currentCue && currentCue.text) {
         cues.push(currentCue);
       }
+
       const startH = match[1] ? parseInt(match[1], 10) * 3600 : 0;
       const startM = parseInt(match[2], 10) * 60;
       const startS = parseInt(match[3], 10);
@@ -227,7 +231,52 @@ function parseVttToCues(vttText) {
       const endMs = parseInt(match[8], 10) / 1000;
       const end = endH + endM + endS + endMs;
 
-      currentCue = { start, end, text: '' };
+      const settings = (match[9] || '').toLowerCase();
+
+      // Extract WebVTT vertical line position
+      let vertical = 'bottom';
+      const lineMatch = settings.match(/line:(-?\d+(?:\.\d+)?%?)/);
+      if (lineMatch) {
+        const valStr = lineMatch[1];
+        if (valStr.includes('%')) {
+          const percent = parseFloat(valStr);
+          if (percent <= 30) vertical = 'top';
+          else if (percent <= 68) vertical = 'middle';
+          else vertical = 'bottom';
+        } else {
+          const num = parseFloat(valStr);
+          if (num >= 0 && num <= 4) vertical = 'top';
+          else if (num < 0) vertical = 'bottom';
+        }
+      }
+
+      // Extract WebVTT horizontal alignment & position
+      let horizontal = 'center';
+      const posMatch = settings.match(/position:(\d+(?:\.\d+)?%?)/);
+      const alignMatch = settings.match(/align:(start|left|center|right|end)/);
+
+      if (posMatch) {
+        const posPercent = parseFloat(posMatch[1]);
+        if (posPercent <= 33) horizontal = 'left';
+        else if (posPercent >= 67) horizontal = 'right';
+        else horizontal = 'center';
+      } else if (alignMatch) {
+        const align = alignMatch[1];
+        if (align === 'start' || align === 'left') horizontal = 'left';
+        else if (align === 'end' || align === 'right') horizontal = 'right';
+        else horizontal = 'center';
+      }
+
+      const placement = `${vertical}-${horizontal}`;
+
+      currentCue = {
+        start,
+        end,
+        text: '',
+        placement,
+        vertical,
+        horizontal,
+      };
     } else if (
       currentCue &&
       line.trim() &&
@@ -249,7 +298,7 @@ function parseVttToCues(vttText) {
   return cues;
 }
 
-// Extract manual or auto-generated subtitles using yt-dlp metadata dump
+// Extract ONLY creator-uploaded manual subtitles (Excludes auto-generated captions)
 async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
   if (subtitleCache.has(videoId)) {
     return subtitleCache.get(videoId);
@@ -279,15 +328,19 @@ async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
 
       try {
         const metadata = JSON.parse(stdoutData);
+        // Exclusively fetch metadata.subtitles (Creator uploaded) and ignore metadata.automatic_captions
         const subtitles = metadata.subtitles || {};
-        const autoSubtitles = metadata.automatic_captions || {};
 
-        // Find best subtitle track (manual first, then auto-generated)
+        if (Object.keys(subtitles).length === 0) {
+          const resObj = { found: false, message: 'No official creator subtitles available.', cues: [] };
+          subtitleCache.set(videoId, resObj);
+          return resolve(resObj);
+        }
+
         const subLangKey =
           Object.keys(subtitles).find((k) => k.startsWith(preferredLang)) ||
-          Object.keys(autoSubtitles).find((k) => k.startsWith(preferredLang)) ||
-          Object.keys(subtitles)[0] ||
-          Object.keys(autoSubtitles)[0];
+          Object.keys(subtitles).find((k) => k.startsWith('en')) ||
+          Object.keys(subtitles)[0];
 
         if (!subLangKey) {
           const resObj = { found: false, cues: [] };
@@ -295,7 +348,7 @@ async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
           return resolve(resObj);
         }
 
-        const trackFormats = subtitles[subLangKey] || autoSubtitles[subLangKey] || [];
+        const trackFormats = subtitles[subLangKey] || [];
         const vttTrack = trackFormats.find((f) => f.ext === 'vtt') || trackFormats[0];
 
         if (!vttTrack || !vttTrack.url) {
@@ -312,11 +365,12 @@ async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
         }
 
         const rawVtt = await vttRes.text();
-        const cues = parseVttToCues(rawVtt);
+        const cues = parseVttToPositionalCues(rawVtt);
 
         const result = {
           found: cues.length > 0,
           language: subLangKey,
+          isAutoGenerated: false,
           cues: cues,
         };
 
@@ -338,7 +392,7 @@ async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. TITLE & ARTIST NORMALIZER AND STRICT MATCHER
+// 4. TITLE & ARTIST NORMALIZER AND STRICT MATCHER
 // ─────────────────────────────────────────────────────────────
 
 function cleanTrackTitle(title) {
@@ -390,7 +444,6 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
   const rawTarget = (targetTitle || '').toLowerCase();
   const artist = (targetArtist || '').toLowerCase();
 
-  // 1. Strict Disqualification
   if (DISQUALIFY_REGEX.test(vTitle) && !DISQUALIFY_REGEX.test(rawTarget)) {
     return -5000;
   }
@@ -398,7 +451,6 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     return -5000;
   }
 
-  // 2. Mandatory Title Word Verification
   const targetWords = cleanTarget.split(/\s+/).filter((w) => w.length > 1);
   if (targetWords.length > 0) {
     const matchedWords = targetWords.filter((w) => cleanVTitle.includes(w));
@@ -410,14 +462,12 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 
   let score = 0;
 
-  // 3. Exact Substring Match Bonus
   if (cleanVTitle.includes(cleanTarget) || vTitle.includes(cleanTarget)) {
     score += 600;
   } else {
     score += 200;
   }
 
-  // 4. Channel Verification (Strict: Must be the actual artist's channel)
   const artistClean = cleanString(artist);
   const authorClean = cleanString(vAuthor);
 
@@ -432,7 +482,6 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     score -= 1500;
   }
 
-  // 5. Category Priority
   const category = getYouTubeVideoCategory(vTitle);
   if (category === 'SHORT_FILM') score += 800;
   else if (category === 'OFFICIAL_VIDEO') score += 1000;
@@ -440,13 +489,11 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
   else if (category === 'VISUALIZER') score += 150;
   else if (category === 'AUDIO') score += 50;
 
-  // 6. Live Penalty
   const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTarget);
   if (!isExplicitlyLive && (LIVE_KEYWORDS_REGEX.test(vTitle) || category === 'LIVE')) {
     score -= 1500;
   }
 
-  // 7. Sanity Check for Extended Fan Loops
   const vSeconds = video.seconds || 0;
   if (targetDurationSec > 0 && vSeconds > 0) {
     if (vSeconds > targetDurationSec * 2.2 + 45 && category !== 'SHORT_FILM') {
@@ -458,7 +505,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. ZERO-DEPENDENCY YOUTUBE SEARCH & PARSER
+// 5. ZERO-DEPENDENCY SEARCH & SPONSORBLOCK
 // ─────────────────────────────────────────────────────────────
 
 function parseDurationToSeconds(durationStr) {
@@ -517,10 +564,6 @@ async function searchYouTubeNative(query) {
     return [];
   }
 }
-
-// ─────────────────────────────────────────────────────────────
-// 5. SPONSORBLOCK INTRO OFFSET ENGINE
-// ─────────────────────────────────────────────────────────────
 
 async function getSponsorBlockIntroOffset(ytVideoId) {
   try {
@@ -947,7 +990,7 @@ app.get('/api/yt-stream', async (req, res) => {
   }
 });
 
-// YouTube Subtitles Endpoint (Manual + Auto-Captions)
+// Positional Creator Subtitles Endpoint (Manual Only)
 app.get('/api/subtitles', async (req, res) => {
   try {
     const { videoId, lang = 'en' } = req.query;
