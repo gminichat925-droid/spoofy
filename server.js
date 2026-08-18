@@ -25,8 +25,9 @@ let lastAppleTokenAttempt = 0;
 let cachedSpotifyToken = null;
 let spotifyTokenExpiresAt = 0;
 
-// In-Memory Offset Cache (Track Name + Artist -> Intro Offset in seconds)
+// In-Memory Cache
 const videoOffsetCache = new Map();
+const rawStreamUrlCache = new Map();
 
 // ─────────────────────────────────────────────────────────────
 // 1. TIDAL AUDIO STREAMING
@@ -138,113 +139,73 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. YOUTUBE DIRECT STREAM EXTRACTOR (NATIVE INNER-TUBE API)
+// 2. MULTI-INSTANCE YOUTUBE STREAM EXTRACTOR
 // ─────────────────────────────────────────────────────────────
 
-async function getYouTubeDirectStreamUrl(videoId) {
-  if (!videoId) return null;
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+  'https://yt.artemislena.eu',
+  'https://invidious.tiekoetter.com',
+  'https://invidious.f5.si'
+];
 
-  // Primary: Android Client (Fetches direct HLS master .m3u8 or muxed MP4s)
+async function resolveDirectYouTubeStream(videoId) {
+  if (rawStreamUrlCache.has(videoId)) {
+    const cached = rawStreamUrlCache.get(videoId);
+    if (Date.now() < cached.expiresAt) return cached.url;
+  }
+
+  // 1. Try Invidious Instances
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/api/v1/videos/${videoId}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(3000),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.hlsUrl) {
+          rawStreamUrlCache.set(videoId, { url: data.hlsUrl, expiresAt: Date.now() + 3600000 });
+          return data.hlsUrl;
+        }
+
+        const formats = data.formatStreams || [];
+        if (formats.length > 0) {
+          formats.sort((a, b) => (parseInt(b.qualityLabel, 10) || 0) - (parseInt(a.qualityLabel, 10) || 0));
+          const best = formats[0].url;
+          rawStreamUrlCache.set(videoId, { url: best, expiresAt: Date.now() + 3600000 });
+          return best;
+        }
+      }
+    } catch (err) {}
+  }
+
+  // 2. Android InnerTube Fallback
   try {
-    const payload = {
-      videoId: videoId,
-      context: {
-        client: {
-          clientName: 'ANDROID',
-          clientVersion: '19.09.37',
-          androidSdkVersion: 30,
-          hl: 'en',
-          gl: 'US',
-        },
-      },
-    };
-
     const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11; US) gzip',
+        'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11; US)',
       },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      const streamingData = data.streamingData;
-      if (streamingData) {
-        if (streamingData.hlsManifestUrl) {
-          return streamingData.hlsManifestUrl;
-        }
-
-        const formats = streamingData.formats || [];
-        const muxed = formats.filter((f) => f.url && f.mimeType && f.mimeType.includes('video/mp4'));
-        if (muxed.length > 0) {
-          muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
-          return muxed[0].url;
-        }
-
-        const anyWithUrl = formats.find((f) => f.url);
-        if (anyWithUrl) return anyWithUrl.url;
-      }
-    }
-  } catch (err) {
-    console.warn(`[YouTube Stream Extractor Android Error] ${videoId}: ${err.message}`);
-  }
-
-  // Secondary: iOS Client Fallback
-  try {
-    const payload = {
-      videoId: videoId,
-      context: {
-        client: {
-          clientName: 'IOS',
-          clientVersion: '19.29.1',
-          deviceModel: 'iPhone14,3',
-          hl: 'en',
-          gl: 'US',
-        },
-      },
-    };
-
-    const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone14,3; U; CPU iOS 17_5_1 like Mac OS X; en_US)',
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      const streamingData = data.streamingData;
-      if (streamingData) {
-        if (streamingData.hlsManifestUrl) return streamingData.hlsManifestUrl;
-        const formats = streamingData.formats || [];
-        const muxed = formats.filter((f) => f.url && f.mimeType && f.mimeType.includes('video/mp4'));
-        if (muxed.length > 0) {
-          muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
-          return muxed[0].url;
-        }
-      }
-    }
-  } catch (err) {
-    console.warn(`[YouTube Stream Extractor iOS Error] ${videoId}: ${err.message}`);
-  }
-
-  // Tertiary: Invidious CDN Fallback
-  try {
-    const invRes = await fetch(`https://inv.nadeko.net/api/v1/videos/${videoId}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
+      body: JSON.stringify({
+        videoId,
+        context: { client: { clientName: 'ANDROID', clientVersion: '19.09.37', androidSdkVersion: 30, hl: 'en', gl: 'US' } },
+      }),
       signal: AbortSignal.timeout(4000),
     });
-    if (invRes.ok) {
-      const invData = await invRes.json();
-      if (invData.hlsUrl) return invData.hlsUrl;
-      const format = invData.formatStreams?.slice(-1)[0];
-      if (format?.url) return format.url;
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data.streamingData?.hlsManifestUrl) {
+        return data.streamingData.hlsManifestUrl;
+      }
+      const formats = (data.streamingData?.formats || []).filter(f => f.url);
+      if (formats.length > 0) {
+        return formats[0].url;
+      }
     }
   } catch (err) {}
 
@@ -252,7 +213,7 @@ async function getYouTubeDirectStreamUrl(videoId) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. ZERO-DEPENDENCY YOUTUBE SEARCH & PARSER
+// 3. ZERO-DEPENDENCY YOUTUBE SEARCH & STRICT MATCHER
 // ─────────────────────────────────────────────────────────────
 
 function parseDurationToSeconds(durationStr) {
@@ -312,10 +273,6 @@ async function searchYouTubeNative(query) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// 4. TITLE NORMALIZER & MULTI-TIER CLASSIFIER
-// ─────────────────────────────────────────────────────────────
-
 function cleanTrackTitle(title) {
   if (!title) return '';
   return title
@@ -329,7 +286,7 @@ function cleanTrackTitle(title) {
     .trim();
 }
 
-const NOISE_KEYWORDS_REGEX = /\b(cover|parody|reaction|reacts|instrumental|karaoke|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|remix|mashup)\b/i;
+const NOISE_KEYWORDS_REGEX = /\b(cover|parody|reaction|reacts|instrumental|karaoke|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|remix|mashup|without cut scene|no dialogue|fan made|edit)\b/i;
 const LIVE_KEYWORDS_REGEX = /\b(live|unplugged|performance|concert|festival|session|sessions|tour|stage|awards|rehearsal|acoustic|bbc radio|live at|live from)\b/i;
 const SHORT_FILM_REGEX = /\b(short film|the short film|directors cut|director's cut|extended cut|the movie|cinematic video)\b/i;
 const OFFICIAL_KEYWORDS_REGEX = /\b(official music video|official video|music video)\b/i;
@@ -356,22 +313,22 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
   const rawTarget = (targetTitle || '').toLowerCase();
   const artist = (targetArtist || '').toLowerCase();
 
-  // Strip noise
+  // Strip noise / fan edits
   if (NOISE_KEYWORDS_REGEX.test(vTitle) && !NOISE_KEYWORDS_REGEX.test(rawTarget)) {
-    return -2000;
+    return -3000;
   }
 
-  // 1. Artist Match
+  // 1. Channel / Artist Verification (Heavily rewards verified/VEVO channels)
   if (artist) {
-    if (vAuthor.includes(artist) || artist.includes(vAuthor) || vTitle.includes(artist)) {
-      score += 200;
+    if (vAuthor.includes(artist) || artist.includes(vAuthor)) {
+      score += 450;
     } else {
       score -= 300;
     }
   }
 
   if (vAuthor.includes('vevo') || vAuthor.includes('official') || vAuthor.includes('- topic')) {
-    score += 150;
+    score += 250;
   }
 
   // 2. Title Precision Match
@@ -385,7 +342,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
   // 3. Category Weights
   const category = getYouTubeVideoCategory(vTitle, description, vAuthor);
   if (category === 'SHORT_FILM') score += 400;
-  else if (category === 'OFFICIAL_VIDEO') score += 350;
+  else if (category === 'OFFICIAL_VIDEO') score += 400;
   else if (category === 'LYRIC_VIDEO') score += 200;
   else if (category === 'VISUALIZER') score += 100;
 
@@ -395,14 +352,14 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     score -= 800;
   }
 
-  // 5. Duration Sanity Check
+  // 5. Duration Sanity (Do not penalize Official Videos/Short Films that have story cutscenes)
   const vSeconds = video.seconds || 0;
   if (targetDurationSec > 0 && vSeconds > 0) {
     const durDelta = Math.abs(vSeconds - targetDurationSec);
     if (durDelta <= 15) {
-      score += 100;
-    } else if (durDelta > 180 && category !== 'SHORT_FILM') {
-      score -= 500;
+      score += 80;
+    } else if (durDelta > 600 && category !== 'SHORT_FILM') {
+      score -= 600; // Only penalize if it's over 10 minutes longer
     }
   }
 
@@ -410,7 +367,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 }
 
 // ─────────────────────────────────────────────────────────────
-// 5. SPONSORBLOCK INTRO OFFSET ENGINE
+// 4. SPONSORBLOCK INTRO OFFSET ENGINE
 // ─────────────────────────────────────────────────────────────
 
 async function getSponsorBlockIntroOffset(ytVideoId) {
@@ -461,7 +418,7 @@ async function getAccurateVideoIntroOffset(title, artist, ytVideoId, videoDurati
 }
 
 // ─────────────────────────────────────────────────────────────
-// 6. APPLE MOTION & SPOTIFY / LRCLIB LYRICS
+// 5. APPLE MOTION & SPOTIFY / LRCLIB LYRICS
 // ─────────────────────────────────────────────────────────────
 
 async function getAppleDeveloperToken() {
@@ -724,7 +681,7 @@ async function getLrclibLyrics(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 7. API ENDPOINTS
+// 6. API ENDPOINTS
 // ─────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
@@ -799,11 +756,54 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
+// YouTube Video Byte-Range Stream Proxy (For expo-video)
+app.get('/api/yt-stream', async (req, res) => {
+  try {
+    const { videoId } = req.query;
+    if (!videoId) return res.status(400).json({ error: 'videoId is required' });
+
+    const rawUrl = await resolveDirectYouTubeStream(videoId);
+    if (!rawUrl) {
+      return res.status(404).json({ error: 'Failed to resolve YouTube media stream.' });
+    }
+
+    const clientRange = req.headers.range || 'bytes=0-';
+    const controller = new AbortController();
+    req.on('close', () => controller.abort());
+
+    const upstreamRes = await fetch(rawUrl, {
+      headers: {
+        'Range': clientRange,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      signal: controller.signal,
+    });
+
+    res.status(upstreamRes.status);
+    ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach((h) => {
+      const val = upstreamRes.headers.get(h);
+      if (val) res.setHeader(h, val);
+    });
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    try {
+      await pipeline(Readable.fromWeb(upstreamRes.body), res);
+    } catch (err) {}
+  } catch (error) {
+    console.error('[YT-Stream Error]', error.message);
+    if (!res.headersSent) res.status(500).json({ error: error.message });
+  }
+});
+
 // YouTube Video Search
 app.get('/api/search-video', async (req, res) => {
   try {
     const { q, duration } = req.query;
     if (!q) return res.status(400).json({ error: 'Search query required.' });
+
+    const host = req.get('host');
+    const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const baseUrl = `${protocol}://${host}`;
 
     const cleanQ = cleanTrackTitle(q);
     const targetDurationSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
@@ -822,6 +822,7 @@ app.get('/api/search-video', async (req, res) => {
           duration: v.seconds,
           category: category,
           score: score,
+          videoUrl: `${baseUrl}/api/yt-stream?videoId=${v.videoId}`,
           embedUrl: `https://www.youtube-nocookie.com/embed/${v.videoId}?autoplay=1&enablejsapi=1`,
         };
       })
@@ -835,25 +836,22 @@ app.get('/api/search-video', async (req, res) => {
   }
 });
 
-// YouTube Video Details & Direct Media Stream
+// YouTube Video Details
 app.get('/api/video', async (req, res) => {
   try {
     const { videoId } = req.query;
     if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
-    const [directStreamUrl, sbOffset] = await Promise.all([
-      getYouTubeDirectStreamUrl(videoId),
-      getSponsorBlockIntroOffset(videoId),
-    ]);
+    const host = req.get('host');
+    const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const baseUrl = `${protocol}://${host}`;
 
-    if (!directStreamUrl) {
-      return res.status(404).json({ success: false, error: 'Could not extract playable stream URL.' });
-    }
+    const sbOffset = await getSponsorBlockIntroOffset(videoId);
 
     res.json({
       success: true,
       videoId: videoId,
-      videoUrl: directStreamUrl, // Direct .m3u8 / .mp4 media stream for expo-video
+      videoUrl: `${baseUrl}/api/yt-stream?videoId=${videoId}`,
       startOffset: sbOffset || 0,
       embedUrl: `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1`,
       watchUrl: `https://www.youtube.com/watch?v=${videoId}`,
@@ -869,11 +867,16 @@ app.get('/api/official-video', async (req, res) => {
     const { title, artist, duration, preferType } = req.query;
     if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
 
+    const host = req.get('host');
+    const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const baseUrl = `${protocol}://${host}`;
+
     const cleanTitle = cleanTrackTitle(title);
     const audioDurSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
     const queries = [
       `${cleanTitle} ${artist} official music video`,
+      `${artist} ${cleanTitle} vevo`,
       `${cleanTitle} ${artist} short film`,
       `${cleanTitle} ${artist} lyric video`,
     ];
@@ -915,15 +918,12 @@ app.get('/api/official-video', async (req, res) => {
     }
 
     const bestVideo = topMatch.video;
-    const [directStreamUrl, startOffset] = await Promise.all([
-      getYouTubeDirectStreamUrl(bestVideo.videoId),
-      getAccurateVideoIntroOffset(title, artist, bestVideo.videoId, bestVideo.seconds, audioDurSec),
-    ]);
+    const startOffset = await getAccurateVideoIntroOffset(title, artist, bestVideo.videoId, bestVideo.seconds, audioDurSec);
 
     res.json({
       found: true,
       videoId: bestVideo.videoId,
-      videoUrl: directStreamUrl, // Direct stream for expo-video
+      videoUrl: `${baseUrl}/api/yt-stream?videoId=${bestVideo.videoId}`,
       title: bestVideo.title,
       artist: bestVideo.author || artist,
       duration: bestVideo.seconds,
