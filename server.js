@@ -3,7 +3,6 @@ const cors = require('cors');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const { Vibrant } = require('node-vibrant/node');
-const ytSearch = require('yt-search');
 
 const app = express();
 app.use(cors());
@@ -30,7 +29,7 @@ let spotifyTokenExpiresAt = 0;
 const videoOffsetCache = new Map();
 
 // ─────────────────────────────────────────────────────────────
-// 1. TIDAL AUDIO STREAMING HELPERS (Kept for Audio Playback)
+// 1. TIDAL AUDIO STREAMING
 // ─────────────────────────────────────────────────────────────
 
 async function getAccessToken() {
@@ -139,7 +138,67 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. YOUTUBE MUSIC VIDEO ENGINE & CLASSIFIER
+// 2. ZERO-DEPENDENCY YOUTUBE SEARCH & PARSER
+// ─────────────────────────────────────────────────────────────
+
+function parseDurationToSeconds(durationStr) {
+  if (!durationStr || typeof durationStr !== 'string') return 0;
+  const parts = durationStr.split(':').map(Number);
+  if (parts.length === 2) return (parts[0] * 60) + parts[1];
+  if (parts.length === 3) return (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+  return 0;
+}
+
+async function searchYouTubeNative(query) {
+  try {
+    const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+    const res = await fetch(searchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) return [];
+    const html = await res.text();
+
+    const dataMatch = html.match(/var ytInitialData\s*=\s*({.+?});<\/script>/s) ||
+                      html.match(/window\["ytInitialData"\]\s*=\s*({.+?});<\/script>/s);
+
+    if (!dataMatch) return [];
+
+    const json = JSON.parse(dataMatch[1]);
+    const sections = json?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+
+    const videos = [];
+    for (const section of sections) {
+      const items = section?.itemSectionRenderer?.contents || [];
+      for (const item of items) {
+        const v = item.videoRenderer;
+        if (v && v.videoId) {
+          const durationText = v.lengthText?.simpleText || '0:00';
+          videos.push({
+            videoId: v.videoId,
+            title: v.title?.runs?.[0]?.text || '',
+            author: v.ownerText?.runs?.[0]?.text || '',
+            seconds: parseDurationToSeconds(durationText),
+            thumbnail: v.thumbnail?.thumbnails?.slice(-1)[0]?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+            description: v.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map(r => r.text).join('') || '',
+          });
+        }
+      }
+    }
+
+    return videos;
+  } catch (err) {
+    console.warn(`[YouTube Search Native Error] ${err.message}`);
+    return [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 3. TITLE NORMALIZER & MULTI-TIER CLASSIFIER
 // ─────────────────────────────────────────────────────────────
 
 function cleanTrackTitle(title) {
@@ -162,7 +221,6 @@ const OFFICIAL_KEYWORDS_REGEX = /\b(official music video|official video|music vi
 const LYRIC_KEYWORDS_REGEX = /\b(lyric video|lyrics video|official lyric video|official lyrics|lyric|lyrics)\b/i;
 const VISUALIZER_REGEX = /\b(visualizer|official visualizer|audio video|track video)\b/i;
 
-// Classify YouTube Video Type
 function getYouTubeVideoCategory(videoTitle, description = '', authorName = '') {
   const combined = `${videoTitle} ${description} ${authorName}`.toLowerCase();
   if (SHORT_FILM_REGEX.test(combined)) return 'SHORT_FILM';
@@ -173,24 +231,22 @@ function getYouTubeVideoCategory(videoTitle, description = '', authorName = '') 
   return 'OTHER';
 }
 
-// Multi-Tier YouTube Scoring Function
 function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSec = 0) {
   let score = 0;
   const vTitle = (video.title || '').toLowerCase();
-  const vAuthor = (video.author?.name || video.author || '').toLowerCase();
+  const vAuthor = (video.author || '').toLowerCase();
   const description = (video.description || '').toLowerCase();
-  const fullText = `${vTitle} ${description} ${vAuthor}`;
 
   const cleanTarget = cleanTrackTitle(targetTitle).toLowerCase();
   const rawTarget = (targetTitle || '').toLowerCase();
   const artist = (targetArtist || '').toLowerCase();
 
-  // Disqualify garbage results (covers, parodies, 1-hour loops, slowed/reverb)
+  // Strip noise
   if (NOISE_KEYWORDS_REGEX.test(vTitle) && !NOISE_KEYWORDS_REGEX.test(rawTarget)) {
     return -2000;
   }
 
-  // 1. Artist Verification
+  // 1. Artist Match
   if (artist) {
     if (vAuthor.includes(artist) || artist.includes(vAuthor) || vTitle.includes(artist)) {
       score += 200;
@@ -199,7 +255,6 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     }
   }
 
-  // VEVO or Official Channel bonus
   if (vAuthor.includes('vevo') || vAuthor.includes('official') || vAuthor.includes('- topic')) {
     score += 150;
   }
@@ -212,27 +267,27 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     score -= 200;
   }
 
-  // 3. Category Bonuses & Priorities
+  // 3. Category Weights
   const category = getYouTubeVideoCategory(vTitle, description, vAuthor);
   if (category === 'SHORT_FILM') score += 400;
   else if (category === 'OFFICIAL_VIDEO') score += 350;
   else if (category === 'LYRIC_VIDEO') score += 200;
   else if (category === 'VISUALIZER') score += 100;
 
-  // 4. Penalize Live Videos unless requested
+  // 4. Live Penalty
   const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTarget);
   if (!isExplicitlyLive && (LIVE_KEYWORDS_REGEX.test(vTitle) || category === 'LIVE')) {
     score -= 800;
   }
 
-  // 5. Duration Proximity Check (Prevents looping clips or hour-long uploads)
-  const vSeconds = video.seconds || (video.duration?.seconds) || 0;
+  // 5. Duration Sanity Check
+  const vSeconds = video.seconds || 0;
   if (targetDurationSec > 0 && vSeconds > 0) {
     const durDelta = Math.abs(vSeconds - targetDurationSec);
     if (durDelta <= 15) {
-      score += 100; // Perfect studio track length match
+      score += 100;
     } else if (durDelta > 180 && category !== 'SHORT_FILM') {
-      score -= 500; // Suspiciously too long for a standard music video
+      score -= 500;
     }
   }
 
@@ -240,7 +295,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. SPONSORBLOCK INTRO OFFSET ENGINE
+// 4. SPONSORBLOCK INTRO OFFSET ENGINE
 // ─────────────────────────────────────────────────────────────
 
 async function getSponsorBlockIntroOffset(ytVideoId) {
@@ -291,7 +346,7 @@ async function getAccurateVideoIntroOffset(title, artist, ytVideoId, videoDurati
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. APPLE MOTION & LYRICS (Unchanged)
+// 5. APPLE MOTION & LYRICS
 // ─────────────────────────────────────────────────────────────
 
 async function getAppleDeveloperToken() {
@@ -554,14 +609,14 @@ async function getLrclibLyrics(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 5. API ENDPOINTS
+// 6. API ENDPOINTS
 // ─────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.json({ status: 'online' });
 });
 
-// Audio Search (Tidal)
+// Audio Search
 app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query;
@@ -592,7 +647,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Stream (Tidal Proxy)
+// Audio Stream (Byte-Range Proxy)
 app.get('/api/stream', async (req, res) => {
   try {
     let { trackId, title, artist } = req.query;
@@ -629,9 +684,7 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// REPLACED: YouTube Video Search (Accurate Categorization)
-// ─────────────────────────────────────────────────────────────
+// YouTube Video Search
 app.get('/api/search-video', async (req, res) => {
   try {
     const { q, duration } = req.query;
@@ -640,27 +693,24 @@ app.get('/api/search-video', async (req, res) => {
     const cleanQ = cleanTrackTitle(q);
     const targetDurationSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
-    // Search YouTube using yt-search
-    const searchResult = await ytSearch(`${cleanQ} official music video`);
-    const rawVideos = searchResult.videos || [];
+    const rawVideos = await searchYouTubeNative(`${cleanQ} official music video`);
 
-    // Filter, Score, and Categorize
     const scoredVideos = rawVideos
       .map((v) => {
-        const category = getYouTubeVideoCategory(v.title, v.description, v.author?.name);
+        const category = getYouTubeVideoCategory(v.title, v.description, v.author);
         const score = getYouTubeVideoScore(v, cleanQ, '', targetDurationSec);
         return {
           id: v.videoId,
           title: v.title,
-          artist: v.author?.name || 'Unknown Artist',
-          thumbnailUrl: v.thumbnail || v.image,
+          artist: v.author || 'Unknown Artist',
+          thumbnailUrl: v.thumbnail,
           duration: v.seconds,
-          category: category, // 'OFFICIAL_VIDEO', 'SHORT_FILM', 'LYRIC_VIDEO', 'VISUALIZER', etc.
+          category: category,
           score: score,
           embedUrl: `https://www.youtube-nocookie.com/embed/${v.videoId}?autoplay=1&enablejsapi=1`,
         };
       })
-      .filter((v) => v.score > -500) // Strip noise/garbage
+      .filter((v) => v.score > -500)
       .sort((a, b) => b.score - a.score);
 
     res.json({ videos: scoredVideos.slice(0, 15) });
@@ -670,9 +720,7 @@ app.get('/api/search-video', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// REPLACED: YouTube Video Details Endpoint
-// ─────────────────────────────────────────────────────────────
+// YouTube Video Embed / Info
 app.get('/api/video', async (req, res) => {
   try {
     const { videoId } = req.query;
@@ -692,9 +740,7 @@ app.get('/api/video', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// REPLACED: Official YouTube Music Video / Short Film / Lyric Video
-// ─────────────────────────────────────────────────────────────
+// Official Matched YouTube Video (Music Video / Short Film / Lyric Video)
 app.get('/api/official-video', async (req, res) => {
   try {
     const { title, artist, duration, preferType } = req.query;
@@ -703,22 +749,19 @@ app.get('/api/official-video', async (req, res) => {
     const cleanTitle = cleanTrackTitle(title);
     const audioDurSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
-    // Search specifically tailored to artist & clean title
-    const searchQueries = [
+    const queries = [
       `${cleanTitle} ${artist} official music video`,
       `${cleanTitle} ${artist} short film`,
       `${cleanTitle} ${artist} lyric video`,
     ];
 
-    const searchPromises = searchQueries.map(q => ytSearch(q).catch(() => ({ videos: [] })));
-    const searchResponses = await Promise.all(searchPromises);
+    const responses = await Promise.all(queries.map(q => searchYouTubeNative(q)));
 
-    // Combine & deduplicate results by videoId
     const seenIds = new Set();
     const candidateVideos = [];
 
-    for (const resObj of searchResponses) {
-      for (const v of resObj.videos || []) {
+    for (const vList of responses) {
+      for (const v of vList) {
         if (!seenIds.has(v.videoId)) {
           seenIds.add(v.videoId);
           candidateVideos.push(v);
@@ -730,21 +773,15 @@ app.get('/api/official-video', async (req, res) => {
       return res.json({ found: false, message: 'No YouTube videos found.' });
     }
 
-    // Score all candidates
     const scoredList = candidateVideos.map((v) => {
       let score = getYouTubeVideoScore(v, title, artist, audioDurSec);
-      const category = getYouTubeVideoCategory(v.title, v.description, v.author?.name);
+      const category = getYouTubeVideoCategory(v.title, v.description, v.author);
 
-      // Support explicit preference if provided in query (?preferType=SHORT_FILM or LYRIC_VIDEO)
       if (preferType && category === preferType.toUpperCase()) {
         score += 600;
       }
 
-      return {
-        video: v,
-        score,
-        category,
-      };
+      return { video: v, score, category };
     });
 
     scoredList.sort((a, b) => b.score - a.score);
@@ -761,10 +798,10 @@ app.get('/api/official-video', async (req, res) => {
       found: true,
       videoId: bestVideo.videoId,
       title: bestVideo.title,
-      artist: bestVideo.author?.name || artist,
+      artist: bestVideo.author || artist,
       duration: bestVideo.seconds,
-      thumbnailUrl: bestVideo.thumbnail || bestVideo.image,
-      category: topMatch.category, // 'SHORT_FILM', 'OFFICIAL_VIDEO', 'LYRIC_VIDEO', 'VISUALIZER'
+      thumbnailUrl: bestVideo.thumbnail,
+      category: topMatch.category,
       startOffset: startOffset,
       embedUrl: `https://www.youtube-nocookie.com/embed/${bestVideo.videoId}?autoplay=1&enablejsapi=1`,
       watchUrl: `https://www.youtube.com/watch?v=${bestVideo.videoId}`
@@ -775,7 +812,7 @@ app.get('/api/official-video', async (req, res) => {
   }
 });
 
-// Apple Motion & Color (Taylor's Version Safe)
+// Apple Motion & Color
 app.get('/api/motion', async (req, res) => {
   try {
     const { album, artist, coverUrl } = req.query;
