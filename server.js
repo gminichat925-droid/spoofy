@@ -139,15 +139,16 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. MULTI-INSTANCE YOUTUBE STREAM EXTRACTOR
+// 2. HIGH-RELIABILITY YOUTUBE STREAM EXTRACTOR (PIPED + HLS)
 // ─────────────────────────────────────────────────────────────
 
-const INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://yt.artemislena.eu',
-  'https://invidious.tiekoetter.com',
-  'https://invidious.f5.si',
+const PIPED_INSTANCES = [
+  'https://api.piped.private.coffee',
+  'https://pipedapi.tokhmi.xyz',
+  'https://pipedapi.kavin.rocks',
+  'https://api.piped.yt',
+  'https://pipedapi.in.projectsegfau.lt',
+  'https://pa.il.ax'
 ];
 
 async function resolveDirectYouTubeStream(videoId) {
@@ -156,33 +157,70 @@ async function resolveDirectYouTubeStream(videoId) {
     if (Date.now() < cached.expiresAt) return cached.url;
   }
 
-  // 1. Try Invidious Instances
+  // Tier 1: Query Piped API Nodes for Direct HLS / Stream URLs
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/streams/${videoId}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        signal: AbortSignal.timeout(3500),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        
+        // 1. Direct HLS Master Playlist (Fastest & best quality for expo-video)
+        if (data.hls) {
+          rawStreamUrlCache.set(videoId, { url: data.hls, expiresAt: Date.now() + 1800000 });
+          return data.hls;
+        }
+
+        // 2. Direct Video + Audio MP4 Streams
+        const streams = (data.videoStreams || []).filter(s => s.url && !s.videoOnly);
+        if (streams.length > 0) {
+          // Sort by highest resolution (720p > 480p > 360p)
+          streams.sort((a, b) => (parseInt(b.quality, 10) || 0) - (parseInt(a.quality, 10) || 0));
+          const bestUrl = streams[0].url;
+          rawStreamUrlCache.set(videoId, { url: bestUrl, expiresAt: Date.now() + 1800000 });
+          return bestUrl;
+        }
+      }
+    } catch (err) {}
+  }
+
+  // Tier 2: Invidious Proxy Stream Fallback
+  const INVIDIOUS_INSTANCES = [
+    'https://inv.nadeko.net',
+    'https://invidious.nerdvpn.de',
+    'https://invidious.tiekoetter.com',
+    'https://invidious.f5.si'
+  ];
+
   for (const instance of INVIDIOUS_INSTANCES) {
     try {
       const res = await fetch(`${instance}/api/v1/videos/${videoId}`, {
         headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(3000),
+        signal: AbortSignal.timeout(3500),
       });
 
       if (res.ok) {
         const data = await res.json();
         if (data.hlsUrl) {
-          rawStreamUrlCache.set(videoId, { url: data.hlsUrl, expiresAt: Date.now() + 3600000 });
+          rawStreamUrlCache.set(videoId, { url: data.hlsUrl, expiresAt: Date.now() + 1800000 });
           return data.hlsUrl;
         }
 
-        const formats = data.formatStreams || [];
+        const formats = (data.formatStreams || []).filter(f => f.url);
         if (formats.length > 0) {
           formats.sort((a, b) => (parseInt(b.qualityLabel, 10) || 0) - (parseInt(a.qualityLabel, 10) || 0));
           const best = formats[0].url;
-          rawStreamUrlCache.set(videoId, { url: best, expiresAt: Date.now() + 3600000 });
+          rawStreamUrlCache.set(videoId, { url: best, expiresAt: Date.now() + 1800000 });
           return best;
         }
       }
     } catch (err) {}
   }
 
-  // 2. Android InnerTube Fallback
+  // Tier 3: InnerTube Android Client Fallback
   try {
     const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
       method: 'POST',
@@ -229,7 +267,6 @@ function cleanTrackTitle(title) {
     .trim();
 }
 
-// Strict Noise & BTS filters (Checked strictly against VIDEO TITLE)
 const DISQUALIFY_REGEX = /\b(behind the scenes|making of|bts|in the studio|trailer|teaser|snippet|preview|interview|vlog|track by track|unboxing|promo|commentary|reaction|reacts|review|parody|karaoke|instrumental|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|mashup|without cut scene|no dialogue|fan made|fan edit)\b/i;
 const LIVE_KEYWORDS_REGEX = /\b(live|unplugged|performance|concert|festival|session|sessions|tour|stage|awards|rehearsal|acoustic|bbc radio|live at|live from|en vivo|ao vivo)\b/i;
 const SHORT_FILM_REGEX = /\b(short film|the short film|directors cut|director's cut|extended cut|the movie|cinematic video)\b/i;
@@ -258,19 +295,16 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
   const rawTarget = (targetTitle || '').toLowerCase();
   const artist = (targetArtist || '').toLowerCase();
 
-  // 1. Strict Disqualification for BTS, Trailers, and Fan Edits
   if (DISQUALIFY_REGEX.test(vTitle) && !DISQUALIFY_REGEX.test(rawTarget)) {
     return -5000;
   }
 
-  // Reject clips under 45 seconds (TikTok cuts/teasers)
   if (video.seconds && video.seconds < 45) {
     return -5000;
   }
 
   let score = 0;
 
-  // 2. Channel Verification
   if (artist) {
     if (vAuthor.includes(artist) || artist.includes(vAuthor)) {
       score += 500;
@@ -283,7 +317,6 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
     score += 300;
   }
 
-  // 3. Title Core Matching
   const cleanVTitle = cleanTrackTitle(vTitle).toLowerCase();
   if (cleanVTitle.includes(cleanTarget) || vTitle.includes(cleanTarget)) {
     score += 400;
@@ -291,15 +324,13 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
     score -= 500;
   }
 
-  // 4. Video Category Priority (Based on title)
   const category = getYouTubeVideoCategory(vTitle);
   if (category === 'SHORT_FILM') score += 800;
-  else if (category === 'OFFICIAL_VIDEO') score += 1000; // Dominant boost for actual official music videos
+  else if (category === 'OFFICIAL_VIDEO') score += 1000;
   else if (category === 'LYRIC_VIDEO') score += 300;
   else if (category === 'VISUALIZER') score += 150;
   else if (category === 'AUDIO') score += 50;
 
-  // 5. Live Penalty
   const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTarget);
   if (!isExplicitlyLive && (LIVE_KEYWORDS_REGEX.test(vTitle) || category === 'LIVE')) {
     score -= 1200;
@@ -801,7 +832,7 @@ app.get('/api/yt-stream', async (req, res) => {
 // YouTube Video Search
 app.get('/api/search-video', async (req, res) => {
   try {
-    const { q } = req.query;
+    const { q, duration } = req.query;
     if (!q) return res.status(400).json({ error: 'Search query required.' });
 
     const host = req.get('host');
