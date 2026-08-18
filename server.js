@@ -26,9 +26,10 @@ let lastAppleTokenAttempt = 0;
 let cachedSpotifyToken = null;
 let spotifyTokenExpiresAt = 0;
 
-// In-Memory Cache
+// In-Memory Caches
 const videoOffsetCache = new Map();
 const rawStreamUrlCache = new Map();
+const subtitleCache = new Map();
 
 // ─────────────────────────────────────────────────────────────
 // 1. TIDAL AUDIO STREAMING
@@ -140,7 +141,7 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. YT-DLP DIRECT STREAM EXTRACTOR
+// 2. YT-DLP DIRECT STREAM & SUBTITLE EXTRACTOR
 // ─────────────────────────────────────────────────────────────
 
 function getStreamUrlFromYtDlp(videoId) {
@@ -197,6 +198,143 @@ async function resolveDirectYouTubeStream(videoId) {
   }
 
   return null;
+}
+
+// Parse WebVTT content into clean, timed cue objects
+function parseVttToCues(vttText) {
+  if (!vttText) return [];
+  const lines = vttText.replace(/\r\n/g, '\n').split('\n');
+  const cues = [];
+  const timeRegex = /(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})/;
+
+  let currentCue = null;
+
+  for (const line of lines) {
+    const match = line.match(timeRegex);
+    if (match) {
+      if (currentCue && currentCue.text) {
+        cues.push(currentCue);
+      }
+      const startH = match[1] ? parseInt(match[1], 10) * 3600 : 0;
+      const startM = parseInt(match[2], 10) * 60;
+      const startS = parseInt(match[3], 10);
+      const startMs = parseInt(match[4], 10) / 1000;
+      const start = startH + startM + startS + startMs;
+
+      const endH = match[5] ? parseInt(match[5], 10) * 3600 : 0;
+      const endM = parseInt(match[6], 10) * 60;
+      const endS = parseInt(match[7], 10);
+      const endMs = parseInt(match[8], 10) / 1000;
+      const end = endH + endM + endS + endMs;
+
+      currentCue = { start, end, text: '' };
+    } else if (
+      currentCue &&
+      line.trim() &&
+      !line.startsWith('WEBVTT') &&
+      !line.startsWith('NOTE') &&
+      !/^\d+$/.test(line.trim())
+    ) {
+      const cleanText = line.replace(/<[^>]*>/g, '').trim();
+      if (cleanText) {
+        currentCue.text = currentCue.text ? `${currentCue.text} ${cleanText}` : cleanText;
+      }
+    }
+  }
+
+  if (currentCue && currentCue.text) {
+    cues.push(currentCue);
+  }
+
+  return cues;
+}
+
+// Extract manual or auto-generated subtitles using yt-dlp metadata dump
+async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
+  if (subtitleCache.has(videoId)) {
+    return subtitleCache.get(videoId);
+  }
+
+  return new Promise((resolve) => {
+    const ytProcess = spawn('yt-dlp', [
+      '--dump-single-json',
+      '--no-warnings',
+      '--no-playlist',
+      '--extractor-args', 'youtube:player_client=android,ios,web_safari',
+      `https://www.youtube.com/watch?v=${videoId}`,
+    ]);
+
+    let stdoutData = '';
+
+    ytProcess.stdout.on('data', (chunk) => {
+      stdoutData += chunk.toString();
+    });
+
+    ytProcess.on('close', async (code) => {
+      if (code !== 0 || !stdoutData.trim()) {
+        const fallback = { found: false, cues: [] };
+        subtitleCache.set(videoId, fallback);
+        return resolve(fallback);
+      }
+
+      try {
+        const metadata = JSON.parse(stdoutData);
+        const subtitles = metadata.subtitles || {};
+        const autoSubtitles = metadata.automatic_captions || {};
+
+        // Find best subtitle track (manual first, then auto-generated)
+        const subLangKey =
+          Object.keys(subtitles).find((k) => k.startsWith(preferredLang)) ||
+          Object.keys(autoSubtitles).find((k) => k.startsWith(preferredLang)) ||
+          Object.keys(subtitles)[0] ||
+          Object.keys(autoSubtitles)[0];
+
+        if (!subLangKey) {
+          const resObj = { found: false, cues: [] };
+          subtitleCache.set(videoId, resObj);
+          return resolve(resObj);
+        }
+
+        const trackFormats = subtitles[subLangKey] || autoSubtitles[subLangKey] || [];
+        const vttTrack = trackFormats.find((f) => f.ext === 'vtt') || trackFormats[0];
+
+        if (!vttTrack || !vttTrack.url) {
+          const resObj = { found: false, cues: [] };
+          subtitleCache.set(videoId, resObj);
+          return resolve(resObj);
+        }
+
+        const vttRes = await fetch(vttTrack.url, { signal: AbortSignal.timeout(5000) });
+        if (!vttRes.ok) {
+          const resObj = { found: false, cues: [] };
+          subtitleCache.set(videoId, resObj);
+          return resolve(resObj);
+        }
+
+        const rawVtt = await vttRes.text();
+        const cues = parseVttToCues(rawVtt);
+
+        const result = {
+          found: cues.length > 0,
+          language: subLangKey,
+          cues: cues,
+        };
+
+        subtitleCache.set(videoId, result);
+        resolve(result);
+      } catch (err) {
+        const resObj = { found: false, cues: [] };
+        subtitleCache.set(videoId, resObj);
+        resolve(resObj);
+      }
+    });
+
+    ytProcess.on('error', () => {
+      const resObj = { found: false, cues: [] };
+      subtitleCache.set(videoId, resObj);
+      resolve(resObj);
+    });
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -266,7 +404,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     const matchedWords = targetWords.filter((w) => cleanVTitle.includes(w));
     const matchRatio = matchedWords.length / targetWords.length;
     if (matchRatio < 0.6) {
-      return -5000; // Complete mismatch
+      return -5000;
     }
   }
 
@@ -289,9 +427,9 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     (vAuthor.includes('vevo') && artist.split(' ').some((part) => vAuthor.includes(part.toLowerCase())));
 
   if (isAuthorMatch) {
-    score += 1500; // Huge boost for the verified artist/VEVO channel
+    score += 1500;
   } else {
-    score -= 1500; // Heavy penalty for 3rd-party fan uploaders (like Nova Tracks)
+    score -= 1500;
   }
 
   // 5. Category Priority
@@ -308,11 +446,11 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     score -= 1500;
   }
 
-  // 7. Sanity Check for Extended Fan Loops (e.g. 529s for a 200s song)
+  // 7. Sanity Check for Extended Fan Loops
   const vSeconds = video.seconds || 0;
   if (targetDurationSec > 0 && vSeconds > 0) {
     if (vSeconds > targetDurationSec * 2.2 + 45 && category !== 'SHORT_FILM') {
-      score -= 2500; // Over twice the song duration
+      score -= 2500;
     }
   }
 
@@ -806,6 +944,19 @@ app.get('/api/yt-stream', async (req, res) => {
   } catch (error) {
     console.error('[YT-Stream Error]', error.message);
     if (!res.headersSent) res.status(500).json({ error: error.message });
+  }
+});
+
+// YouTube Subtitles Endpoint (Manual + Auto-Captions)
+app.get('/api/subtitles', async (req, res) => {
+  try {
+    const { videoId, lang = 'en' } = req.query;
+    if (!videoId) return res.status(400).json({ error: 'videoId is required' });
+
+    const subData = await getYouTubeSubtitles(videoId, lang);
+    res.json(subData);
+  } catch (error) {
+    res.status(500).json({ found: false, error: error.message, cues: [] });
   }
 });
 
