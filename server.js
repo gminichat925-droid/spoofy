@@ -140,15 +140,16 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. YT-DLP DIRECT STREAM EXTRACTOR
+// 2. YT-DLP DIRECT STREAM EXTRACTOR (MOBILE CLIENTS)
 // ─────────────────────────────────────────────────────────────
 
 function getStreamUrlFromYtDlp(videoId) {
   return new Promise((resolve, reject) => {
-    // Prefer muxed 720p/480p mp4 for mobile streaming
+    // Uses android,ios,web_safari player clients to bypass web reload bot challenges
     const ytProcess = spawn('yt-dlp', [
       '-g',
-      '-f', '18/22/best[ext=mp4][height<=720]/best[height<=720]/best',
+      '-f', '18/22/b[ext=mp4][height<=720]/best[height<=720]/best',
+      '--extractor-args', 'youtube:player_client=android,ios,web_safari',
       '--no-warnings',
       '--no-playlist',
       `https://www.youtube.com/watch?v=${videoId}`,
@@ -739,7 +740,7 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// YouTube Video Stream Proxy (yt-dlp Stream Proxy with Byte-Range support)
+// YouTube Video Byte-Range Stream Proxy (yt-dlp Stream Proxy with Byte-Range support)
 app.get('/api/yt-stream', async (req, res) => {
   try {
     const { videoId } = req.query;
