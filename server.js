@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
-const { spawn } = require('child_process');
-const { Vibrant } = require('node-vibrant/node'); 
+const { Vibrant } = require('node-vibrant/node');
+const ytSearch = require('yt-search');
 
 const app = express();
 app.use(cors());
@@ -21,7 +21,7 @@ let tokenExpiresAt = 0;
 
 let cachedAppleToken = null;
 let appleTokenExpiresAt = 0;
-let lastAppleTokenAttempt = 0; 
+let lastAppleTokenAttempt = 0;
 
 let cachedSpotifyToken = null;
 let spotifyTokenExpiresAt = 0;
@@ -29,7 +29,10 @@ let spotifyTokenExpiresAt = 0;
 // In-Memory Offset Cache (Track Name + Artist -> Intro Offset in seconds)
 const videoOffsetCache = new Map();
 
-// 1. Refresh Tidal Access Token
+// ─────────────────────────────────────────────────────────────
+// 1. TIDAL AUDIO STREAMING HELPERS (Kept for Audio Playback)
+// ─────────────────────────────────────────────────────────────
+
 async function getAccessToken() {
   if (!REFRESH_TOKEN) throw new Error('TIDAL_REFRESH_TOKEN environment variable is missing.');
   if (cachedAccessToken && Date.now() < tokenExpiresAt - 60000) return cachedAccessToken;
@@ -51,14 +54,13 @@ async function getAccessToken() {
   });
 
   if (!res.ok) throw new Error(`Failed to refresh Tidal token: ${res.status}`);
-  
+
   const data = await res.json();
   cachedAccessToken = data.access_token;
   tokenExpiresAt = Date.now() + data.expires_in * 1000;
   return cachedAccessToken;
 }
 
-// 2. Fetch Direct Stream URL from Tidal Manifest
 async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   const token = await getAccessToken();
   const url = `https://api.tidal.com/v1/tracks/${trackId}/playbackinfopostpaywall?audioquality=${quality}&playbackmode=STREAM&assetpresentation=FULL&audioMode=STEREO`;
@@ -78,8 +80,7 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
 
   if (data.manifest) {
     const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
-    
-    // DASH XML
+
     if (data.manifestMimeType === 'application/dash+xml') {
       if (decodedManifest.includes('<ContentProtection')) {
         console.warn(`[Tidal] 🔒 DASH Track ${trackId} is DRM Protected at ${quality}.`);
@@ -90,11 +91,10 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
 
       const baseUrlMatch = decodedManifest.match(/<BaseURL>(.+?)<\/BaseURL>/);
       if (baseUrlMatch && baseUrlMatch[1]) {
-        return baseUrlMatch[1].replace(/&/g, '&'); 
+        return baseUrlMatch[1].replace(/&amp;/g, '&');
       }
     }
 
-    // JSON Manifest
     try {
       const manifestJson = JSON.parse(decodedManifest);
       const isDRM = manifestJson.encryptionType && manifestJson.encryptionType !== 'NONE';
@@ -109,14 +109,13 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
       }
     } catch (e) {
       const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
-      if (urlMatch) return urlMatch[0].replace(/&/g, '&');
+      if (urlMatch) return urlMatch[0].replace(/&amp;/g, '&');
     }
   }
-  
+
   throw new Error('No audio URL found in Tidal manifest.');
 }
 
-// 2.5 Helper to Search Tidal by Title and Artist
 async function searchTidalForTrack(title, artist) {
   try {
     const token = await getAccessToken();
@@ -139,45 +138,8 @@ async function searchTidalForTrack(title, artist) {
   return null;
 }
 
-// 2.6 Fetch Direct Stream URL for Music Videos
-async function getTidalVideoStreamUrl(videoId) {
-  const token = await getAccessToken();
-  const url = `https://api.tidal.com/v1/videos/${videoId}/playbackinfopostpaywall?videoquality=HIGH&playbackmode=STREAM&assetpresentation=FULL`;
-
-  const res = await fetch(url, {
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'x-tidal-token': CLIENT_ID,
-    },
-    signal: AbortSignal.timeout(5000),
-  });
-
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`Tidal Video API failed: ${res.status} ${errorText}`);
-  }
-
-  const data = await res.json();
-
-  if (data.manifest) {
-    const decodedManifest = Buffer.from(data.manifest, 'base64').toString('utf-8');
-
-    try {
-      const manifestJson = JSON.parse(decodedManifest);
-      if (manifestJson.urls && manifestJson.urls.length > 0) {
-        return manifestJson.urls[0]; 
-      }
-    } catch (e) {
-      const urlMatch = decodedManifest.match(/https?:\/\/[^\s"<]+/);
-      if (urlMatch) return urlMatch[0];
-    }
-  }
-
-  throw new Error('No video URL found in Tidal manifest.');
-}
-
 // ─────────────────────────────────────────────────────────────
-// 3. TITLE NORMALIZER & MULTI-TIER SMART VIDEO SELECTOR
+// 2. YOUTUBE MUSIC VIDEO ENGINE & CLASSIFIER
 // ─────────────────────────────────────────────────────────────
 
 function cleanTrackTitle(title) {
@@ -193,119 +155,93 @@ function cleanTrackTitle(title) {
     .trim();
 }
 
-const LIVE_KEYWORDS_REGEX = /\b(live|unplugged|mtv unplugged|performance|concert|festival|session|sessions|tour|stage|awards|rehearsal|acoustic|behind the scenes|making of|vevo lift|vevo dscvr|bbc radio|live at|live from|stripped|en vivo|ao vivo|world tour|on the run)\b/i;
-const LYRIC_KEYWORDS_REGEX = /\b(lyric|lyrics|lyric video|visualizer|audio|audio video|track video|visualizer video|canvas)\b/i;
-const OFFICIAL_KEYWORDS_REGEX = /\b(official music video|official video|music video|short film|the short film|directors cut|director's cut|extended version)\b/i;
+const NOISE_KEYWORDS_REGEX = /\b(cover|parody|reaction|reacts|instrumental|karaoke|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|remix|mashup)\b/i;
+const LIVE_KEYWORDS_REGEX = /\b(live|unplugged|performance|concert|festival|session|sessions|tour|stage|awards|rehearsal|acoustic|bbc radio|live at|live from)\b/i;
+const SHORT_FILM_REGEX = /\b(short film|the short film|directors cut|director's cut|extended cut|the movie|cinematic video)\b/i;
+const OFFICIAL_KEYWORDS_REGEX = /\b(official music video|official video|music video)\b/i;
+const LYRIC_KEYWORDS_REGEX = /\b(lyric video|lyrics video|official lyric video|official lyrics|lyric|lyrics)\b/i;
+const VISUALIZER_REGEX = /\b(visualizer|official visualizer|audio video|track video)\b/i;
 
-function getVideoScore(video, rawTargetTitle, targetArtist) {
+// Classify YouTube Video Type
+function getYouTubeVideoCategory(videoTitle, description = '', authorName = '') {
+  const combined = `${videoTitle} ${description} ${authorName}`.toLowerCase();
+  if (SHORT_FILM_REGEX.test(combined)) return 'SHORT_FILM';
+  if (OFFICIAL_KEYWORDS_REGEX.test(combined)) return 'OFFICIAL_VIDEO';
+  if (LYRIC_KEYWORDS_REGEX.test(combined)) return 'LYRIC_VIDEO';
+  if (VISUALIZER_REGEX.test(combined)) return 'VISUALIZER';
+  if (LIVE_KEYWORDS_REGEX.test(combined)) return 'LIVE';
+  return 'OTHER';
+}
+
+// Multi-Tier YouTube Scoring Function
+function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSec = 0) {
   let score = 0;
   const vTitle = (video.title || '').toLowerCase();
-  const vVersion = (video.version || '').toLowerCase();
-  const albumTitle = (video.album?.title || '').toLowerCase();
-  const fullString = `${vTitle} ${vVersion} ${albumTitle}`;
-  
-  const cleanTarget = cleanTrackTitle(rawTargetTitle).toLowerCase();
-  const rawTarget = (rawTargetTitle || '').toLowerCase();
-  const artist = (targetArtist || '').toLowerCase();
-  const vArtist = (video.artist?.name || video.artists?.[0]?.name || '').toLowerCase();
+  const vAuthor = (video.author?.name || video.author || '').toLowerCase();
+  const description = (video.description || '').toLowerCase();
+  const fullText = `${vTitle} ${description} ${vAuthor}`;
 
-  // 1. Artist Match Verification
+  const cleanTarget = cleanTrackTitle(targetTitle).toLowerCase();
+  const rawTarget = (targetTitle || '').toLowerCase();
+  const artist = (targetArtist || '').toLowerCase();
+
+  // Disqualify garbage results (covers, parodies, 1-hour loops, slowed/reverb)
+  if (NOISE_KEYWORDS_REGEX.test(vTitle) && !NOISE_KEYWORDS_REGEX.test(rawTarget)) {
+    return -2000;
+  }
+
+  // 1. Artist Verification
   if (artist) {
-    if (vArtist && (vArtist.includes(artist) || artist.includes(vArtist))) {
-      score += 150;
+    if (vAuthor.includes(artist) || artist.includes(vAuthor) || vTitle.includes(artist)) {
+      score += 200;
     } else {
-      score -= 500; 
+      score -= 300;
     }
   }
 
-  // 2. Base Title & Short Film Matching
-  const cleanVTitle = cleanTrackTitle(vTitle).toLowerCase();
-  if (cleanVTitle === cleanTarget || vTitle === rawTarget) {
-    score += 200;
-  } else if (cleanVTitle.startsWith(cleanTarget) || cleanTarget.startsWith(cleanVTitle)) {
-    score += 120;
-  } else if (vTitle.includes(cleanTarget) || cleanTarget.includes(vTitle)) {
-    score += 80;
-  }
-
-  // 3. Official Music Video & Short Film Bonuses
-  if (OFFICIAL_KEYWORDS_REGEX.test(fullString)) {
+  // VEVO or Official Channel bonus
+  if (vAuthor.includes('vevo') || vAuthor.includes('official') || vAuthor.includes('- topic')) {
     score += 150;
   }
 
-  // 4. Penalty for Lyric Videos & Visualizers
-  if (LYRIC_KEYWORDS_REGEX.test(fullString)) {
-    score -= 400;
+  // 2. Title Precision Match
+  const cleanVTitle = cleanTrackTitle(vTitle).toLowerCase();
+  if (cleanVTitle.includes(cleanTarget) || vTitle.includes(cleanTarget)) {
+    score += 250;
+  } else {
+    score -= 200;
   }
 
-  // 5. Severe Disqualification Penalty for Live / MTV Unplugged
+  // 3. Category Bonuses & Priorities
+  const category = getYouTubeVideoCategory(vTitle, description, vAuthor);
+  if (category === 'SHORT_FILM') score += 400;
+  else if (category === 'OFFICIAL_VIDEO') score += 350;
+  else if (category === 'LYRIC_VIDEO') score += 200;
+  else if (category === 'VISUALIZER') score += 100;
+
+  // 4. Penalize Live Videos unless requested
   const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTarget);
-  if (!isExplicitlyLive && LIVE_KEYWORDS_REGEX.test(fullString)) {
-    score -= 1000;
+  if (!isExplicitlyLive && (LIVE_KEYWORDS_REGEX.test(vTitle) || category === 'LIVE')) {
+    score -= 800;
+  }
+
+  // 5. Duration Proximity Check (Prevents looping clips or hour-long uploads)
+  const vSeconds = video.seconds || (video.duration?.seconds) || 0;
+  if (targetDurationSec > 0 && vSeconds > 0) {
+    const durDelta = Math.abs(vSeconds - targetDurationSec);
+    if (durDelta <= 15) {
+      score += 100; // Perfect studio track length match
+    } else if (durDelta > 180 && category !== 'SHORT_FILM') {
+      score -= 500; // Suspiciously too long for a standard music video
+    }
   }
 
   return score;
 }
 
-// Multi-Tier Video Candidate Selector
-function selectBestVideo(items, rawTitle, artist) {
-  if (!items || items.length === 0) return null;
-
-  const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTitle);
-
-  const scoredItems = items.map(v => ({
-    video: v,
-    score: getVideoScore(v, rawTitle, artist),
-    isLive: LIVE_KEYWORDS_REGEX.test(`${v.title || ''} ${v.version || ''} ${v.album?.title || ''}`),
-    isLyric: LYRIC_KEYWORDS_REGEX.test(`${v.title || ''} ${v.version || ''} ${v.album?.title || ''}`),
-  }));
-
-  scoredItems.sort((a, b) => b.score - a.score);
-
-  if (!isExplicitlyLive) {
-    // Priority 1: Studio Official Music Videos (Not Live, Not Lyric Video)
-    const studioVideos = scoredItems.filter(item => !item.isLive && !item.isLyric && item.score > 0);
-    if (studioVideos.length > 0) {
-      return studioVideos[0].video;
-    }
-
-    // Priority 2: Non-live fallback (e.g., Short Film or Lyric Video if no studio video exists)
-    const nonLiveVideos = scoredItems.filter(item => !item.isLive && item.score > -300);
-    if (nonLiveVideos.length > 0) {
-      return nonLiveVideos[0].video;
-    }
-  }
-
-  // Priority 3: Fallback (only if user explicitly wanted live or strictly nothing else exists)
-  return scoredItems[0].score > -800 ? scoredItems[0].video : null;
-}
-
 // ─────────────────────────────────────────────────────────────
-// 4. SMART INTRO OFFSET ENGINE
+// 3. SPONSORBLOCK INTRO OFFSET ENGINE
 // ─────────────────────────────────────────────────────────────
-
-async function getYouTubeVideoId(title, artist) {
-  try {
-    const cleanTitle = cleanTrackTitle(title);
-    const query = encodeURIComponent(`${cleanTitle} ${artist} official music video`);
-    const searchUrl = `https://www.youtube.com/results?search_query=${query}`;
-    
-    const res = await fetch(searchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      signal: AbortSignal.timeout(3000),
-    });
-
-    if (!res.ok) return null;
-    const html = await res.text();
-    const match = html.match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
-    return match ? match[1] : null;
-  } catch (err) {
-    return null;
-  }
-}
 
 async function getSponsorBlockIntroOffset(ytVideoId) {
   try {
@@ -324,9 +260,9 @@ async function getSponsorBlockIntroOffset(ytVideoId) {
   return null;
 }
 
-async function getAccurateVideoIntroOffset(title, artist, videoDuration, audioDuration) {
+async function getAccurateVideoIntroOffset(title, artist, ytVideoId, videoDuration, audioDuration) {
   const cleanTitle = cleanTrackTitle(title);
-  const cacheKey = `${cleanTitle.toLowerCase()}|${(artist || '').toLowerCase()}`;
+  const cacheKey = `${cleanTitle.toLowerCase()}|${(artist || '').toLowerCase()}|${ytVideoId}`;
   if (videoOffsetCache.has(cacheKey)) {
     return videoOffsetCache.get(cacheKey);
   }
@@ -336,19 +272,16 @@ async function getAccurateVideoIntroOffset(title, artist, videoDuration, audioDu
 
   let calculatedOffset = 0;
 
-  try {
-    const ytVideoId = await getYouTubeVideoId(cleanTitle, artist);
-    if (ytVideoId) {
-      const sbOffset = await getSponsorBlockIntroOffset(ytVideoId);
-      if (sbOffset !== null && sbOffset > 0) {
-        calculatedOffset = sbOffset;
-      }
+  if (ytVideoId) {
+    const sbOffset = await getSponsorBlockIntroOffset(ytVideoId);
+    if (sbOffset !== null && sbOffset > 0) {
+      calculatedOffset = sbOffset;
     }
-  } catch (e) {}
+  }
 
   if (calculatedOffset === 0 && vDur > 0 && aDur > 0) {
     const delta = vDur - aDur;
-    if (delta >= 3) {
+    if (delta >= 3 && delta < 60) {
       calculatedOffset = Number(delta.toFixed(2));
     }
   }
@@ -358,23 +291,21 @@ async function getAccurateVideoIntroOffset(title, artist, videoDuration, audioDu
 }
 
 // ─────────────────────────────────────────────────────────────
-// 5. APPLE MOTION SCRAPER (PRESERVES TAYLOR'S VERSION & EDITIONS)
+// 4. APPLE MOTION & LYRICS (Unchanged)
 // ─────────────────────────────────────────────────────────────
 
 async function getAppleDeveloperToken() {
   if (cachedAppleToken && Date.now() < appleTokenExpiresAt) return cachedAppleToken;
-  if (Date.now() - lastAppleTokenAttempt < 10 * 60 * 1000) return null; 
+  if (Date.now() - lastAppleTokenAttempt < 10 * 60 * 1000) return null;
 
   lastAppleTokenAttempt = Date.now();
 
   try {
     const res = await fetch('https://music.apple.com/us/browse', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15'
-      },
+      headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15' },
       signal: AbortSignal.timeout(4000),
     });
-    
+
     const html = await res.text();
     const metaKey = 'apple-music-developer-token';
     const metaStart = html.indexOf(metaKey);
@@ -390,10 +321,7 @@ async function getAppleDeveloperToken() {
         }
       }
     }
-  } catch (err) {
-    console.warn(`[Apple Motion] Scrape error: ${err.message}`);
-  }
-
+  } catch (err) {}
   return null;
 }
 
@@ -432,12 +360,9 @@ function extractTallUrlFromRawString(str) {
 
 async function getAppleMotionUrl(albumTitle, artistName) {
   const IPHONE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15';
-  
-  // Keep original album title (with Taylor's Version) for accurate matching
   const exactQuery = `${albumTitle} ${artistName}`;
   const isTaylorVersion = /taylor's version/i.test(albumTitle);
 
-  // Engine 1: Apple Music Developer Amp API
   const token = await getAppleDeveloperToken();
   if (token) {
     try {
@@ -454,8 +379,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
       if (searchRes.ok) {
         const searchData = await searchRes.json();
         const albums = searchData.results?.albums?.data || [];
-
-        // Find the album matching edition requirements
         let targetAlbum = albums[0];
         if (isTaylorVersion) {
           const match = albums.find(a => /taylor's version/i.test(a.attributes?.name || ''));
@@ -483,7 +406,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
     } catch (err) {}
   }
 
-  // Engine 2: iTunes Direct HTML Scraper Fallback
   try {
     const iTunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(exactQuery)}&entity=album&limit=5`;
     const searchRes = await fetch(iTunesUrl, { signal: AbortSignal.timeout(4000) });
@@ -514,10 +436,6 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
   return null;
 }
-
-// ─────────────────────────────────────────────────────────────
-// 6. SPOTIFY & LRCLIB LYRICS ENGINE
-// ─────────────────────────────────────────────────────────────
 
 async function getSpotifyToken() {
   if (!SPOTIFY_SP_DC) return null;
@@ -558,7 +476,7 @@ async function getSpotifyLyrics(title, artist) {
       headers: { 'Authorization': `Bearer ${token}` },
       signal: AbortSignal.timeout(4000),
     });
-    
+
     const searchData = await searchRes.json();
     const trackId = searchData.tracks?.items?.[0]?.id;
     if (!trackId) return null;
@@ -587,14 +505,14 @@ async function getSpotifyLyrics(title, artist) {
 
       if (isWordByWord && line.syllables && line.syllables.length > 0) {
         line.syllables.forEach(syllable => {
-           const sylTime = parseInt(syllable.startTimeMs, 10);
-           if (!isNaN(sylTime)) {
-             const sMins = String(Math.floor(sylTime / 60000)).padStart(2, '0');
-             const sSecs = ((sylTime % 60000) / 1000).toFixed(2).padStart(5, '0');
-             lineContent += `<${sMins}:${sSecs}>${syllable.words}`;
-           } else {
-             lineContent += syllable.words;
-           }
+          const sylTime = parseInt(syllable.startTimeMs, 10);
+          if (!isNaN(sylTime)) {
+            const sMins = String(Math.floor(sylTime / 60000)).padStart(2, '0');
+            const sSecs = ((sylTime % 60000) / 1000).toFixed(2).padStart(5, '0');
+            lineContent += `<${sMins}:${sSecs}>${syllable.words}`;
+          } else {
+            lineContent += syllable.words;
+          }
         });
       } else {
         lineContent = line.words;
@@ -624,7 +542,7 @@ async function getLrclibLyrics(title, artist) {
         const enhancedLrcRegex = /<\d{2}:\d{2}\.\d{2,3}>/;
         const wordByWordMatch = results.find(r => r.syncedLyrics && enhancedLrcRegex.test(r.syncedLyrics));
         if (wordByWordMatch) return { ...wordByWordMatch, isWordByWord: true };
-        
+
         const lineByLineMatch = results.find(r => r.syncedLyrics);
         if (lineByLineMatch) return { ...lineByLineMatch, isWordByWord: false };
 
@@ -636,14 +554,14 @@ async function getLrclibLyrics(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 7. API ENDPOINTS
+// 5. API ENDPOINTS
 // ─────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.json({ status: 'online' });
 });
 
-// Audio Search
+// Audio Search (Tidal)
 app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query;
@@ -674,7 +592,7 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Stream (Byte-Range Proxy)
+// Audio Stream (Tidal Proxy)
 app.get('/api/stream', async (req, res) => {
   try {
     let { trackId, title, artist } = req.query;
@@ -690,18 +608,18 @@ app.get('/api/stream', async (req, res) => {
     const controller = new AbortController();
     req.on('close', () => controller.abort());
 
-    const tidalResponse = await fetch(directStreamUrl, { 
+    const tidalResponse = await fetch(directStreamUrl, {
       headers: { 'Range': clientRange },
-      signal: controller.signal 
+      signal: controller.signal
     });
-    
+
     res.status(tidalResponse.status);
     ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach((h) => {
       const val = tidalResponse.headers.get(h);
       if (val) res.setHeader(h, val);
     });
     res.setHeader('Accept-Ranges', 'bytes');
-    
+
     try {
       await pipeline(Readable.fromWeb(tidalResponse.body), res);
     } catch (err) {}
@@ -711,105 +629,148 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// Video Search (Filtered & Ranked)
+// ─────────────────────────────────────────────────────────────
+// REPLACED: YouTube Video Search (Accurate Categorization)
+// ─────────────────────────────────────────────────────────────
 app.get('/api/search-video', async (req, res) => {
   try {
     const { q, duration } = req.query;
     if (!q) return res.status(400).json({ error: 'Search query required.' });
 
-    const token = await getAccessToken();
     const cleanQ = cleanTrackTitle(q);
+    const targetDurationSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(cleanQ)}&limit=30&types=VIDEOS&countryCode=US`;
-    const searchRes = await fetch(searchUrl, {
-      headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
-      signal: AbortSignal.timeout(5000),
-    });
+    // Search YouTube using yt-search
+    const searchResult = await ytSearch(`${cleanQ} official music video`);
+    const rawVideos = searchResult.videos || [];
 
-    if (!searchRes.ok) throw new Error('Video search request failed');
-    
-    const searchData = await searchRes.json();
-    let rawItems = searchData.videos?.items || searchData.items || [];
+    // Filter, Score, and Categorize
+    const scoredVideos = rawVideos
+      .map((v) => {
+        const category = getYouTubeVideoCategory(v.title, v.description, v.author?.name);
+        const score = getYouTubeVideoScore(v, cleanQ, '', targetDurationSec);
+        return {
+          id: v.videoId,
+          title: v.title,
+          artist: v.author?.name || 'Unknown Artist',
+          thumbnailUrl: v.thumbnail || v.image,
+          duration: v.seconds,
+          category: category, // 'OFFICIAL_VIDEO', 'SHORT_FILM', 'LYRIC_VIDEO', 'VISUALIZER', etc.
+          score: score,
+          embedUrl: `https://www.youtube-nocookie.com/embed/${v.videoId}?autoplay=1&enablejsapi=1`,
+        };
+      })
+      .filter((v) => v.score > -500) // Strip noise/garbage
+      .sort((a, b) => b.score - a.score);
 
-    // Filter and score videos
-    const bestVid = selectBestVideo(rawItems, q, '');
-    const sharedOffset = bestVid ? await getAccurateVideoIntroOffset(bestVid.title, bestVid.artist?.name || '', bestVid.duration, duration) : 0;
-
-    const videos = rawItems
-      .filter(v => !LIVE_KEYWORDS_REGEX.test(`${v.title || ''} ${v.version || ''}`))
-      .slice(0, 10)
-      .map((v) => ({
-        id: v.id,
-        title: v.version ? `${v.title} (${v.version})` : v.title, 
-        artist: v.artist?.name || v.artists?.[0]?.name || 'Unknown Artist',
-        thumbnailUrl: v.imageId ? `https://resources.tidal.com/images/${v.imageId.replace(/-/g, '/')}/320x240.jpg` : null,
-        duration: v.duration,
-        startOffset: sharedOffset,
-      }));
-
-    res.json({ videos });
+    res.json({ videos: scoredVideos.slice(0, 15) });
   } catch (error) {
+    console.error('[YouTube Search Video Error]', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get Video Stream URL (.m3u8 CDN link)
+// ─────────────────────────────────────────────────────────────
+// REPLACED: YouTube Video Details Endpoint
+// ─────────────────────────────────────────────────────────────
 app.get('/api/video', async (req, res) => {
   try {
     const { videoId } = req.query;
     if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
-    const directStreamUrl = await getTidalVideoStreamUrl(videoId);
-    res.json({ success: true, videoUrl: directStreamUrl });
+    const sbOffset = await getSponsorBlockIntroOffset(videoId);
+
+    res.json({
+      success: true,
+      videoId: videoId,
+      embedUrl: `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1`,
+      watchUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      startOffset: sbOffset || 0
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Official Matched Music Video (Multi-Tier Studio Verification)
+// ─────────────────────────────────────────────────────────────
+// REPLACED: Official YouTube Music Video / Short Film / Lyric Video
+// ─────────────────────────────────────────────────────────────
 app.get('/api/official-video', async (req, res) => {
   try {
-    const { title, artist, duration } = req.query;
+    const { title, artist, duration, preferType } = req.query;
     if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
 
-    const token = await getAccessToken();
     const cleanTitle = cleanTrackTitle(title);
-    
-    const searchQuery = `${cleanTitle} ${artist}`;
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(searchQuery)}&limit=30&types=VIDEOS&countryCode=US`;
-    
-    const searchRes = await fetch(searchUrl, {
-      headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
-      signal: AbortSignal.timeout(5000),
+    const audioDurSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
+
+    // Search specifically tailored to artist & clean title
+    const searchQueries = [
+      `${cleanTitle} ${artist} official music video`,
+      `${cleanTitle} ${artist} short film`,
+      `${cleanTitle} ${artist} lyric video`,
+    ];
+
+    const searchPromises = searchQueries.map(q => ytSearch(q).catch(() => ({ videos: [] })));
+    const searchResponses = await Promise.all(searchPromises);
+
+    // Combine & deduplicate results by videoId
+    const seenIds = new Set();
+    const candidateVideos = [];
+
+    for (const resObj of searchResponses) {
+      for (const v of resObj.videos || []) {
+        if (!seenIds.has(v.videoId)) {
+          seenIds.add(v.videoId);
+          candidateVideos.push(v);
+        }
+      }
+    }
+
+    if (candidateVideos.length === 0) {
+      return res.json({ found: false, message: 'No YouTube videos found.' });
+    }
+
+    // Score all candidates
+    const scoredList = candidateVideos.map((v) => {
+      let score = getYouTubeVideoScore(v, title, artist, audioDurSec);
+      const category = getYouTubeVideoCategory(v.title, v.description, v.author?.name);
+
+      // Support explicit preference if provided in query (?preferType=SHORT_FILM or LYRIC_VIDEO)
+      if (preferType && category === preferType.toUpperCase()) {
+        score += 600;
+      }
+
+      return {
+        video: v,
+        score,
+        category,
+      };
     });
 
-    if (!searchRes.ok) throw new Error('Video search request failed');
-    const searchData = await searchRes.json();
-    let items = searchData.videos?.items || searchData.items || [];
+    scoredList.sort((a, b) => b.score - a.score);
 
-    if (items.length === 0) {
-      return res.json({ found: false, message: 'No videos found for this track.' });
+    const topMatch = scoredList[0];
+    if (!topMatch || topMatch.score < -400) {
+      return res.json({ found: false, message: 'No accurate match found on YouTube.' });
     }
 
-    // Select best video via Multi-Tier Studio Selector
-    const bestVideo = selectBestVideo(items, title, artist);
-
-    if (!bestVideo) {
-      return res.json({ found: false, message: 'Studio video unavailable.' });
-    }
-
-    const startOffset = await getAccurateVideoIntroOffset(title, artist, bestVideo.duration, duration);
-    const directStreamUrl = await getTidalVideoStreamUrl(bestVideo.id);
+    const bestVideo = topMatch.video;
+    const startOffset = await getAccurateVideoIntroOffset(title, artist, bestVideo.videoId, bestVideo.seconds, audioDurSec);
 
     res.json({
       found: true,
-      videoId: bestVideo.id,
-      title: bestVideo.version ? `${bestVideo.title} (${bestVideo.version})` : bestVideo.title,
-      duration: bestVideo.duration,
+      videoId: bestVideo.videoId,
+      title: bestVideo.title,
+      artist: bestVideo.author?.name || artist,
+      duration: bestVideo.seconds,
+      thumbnailUrl: bestVideo.thumbnail || bestVideo.image,
+      category: topMatch.category, // 'SHORT_FILM', 'OFFICIAL_VIDEO', 'LYRIC_VIDEO', 'VISUALIZER'
       startOffset: startOffset,
-      videoUrl: directStreamUrl
+      embedUrl: `https://www.youtube-nocookie.com/embed/${bestVideo.videoId}?autoplay=1&enablejsapi=1`,
+      watchUrl: `https://www.youtube.com/watch?v=${bestVideo.videoId}`
     });
   } catch (error) {
+    console.error('[Official Video Error]', error.message);
     res.status(500).json({ error: error.message });
   }
 });
