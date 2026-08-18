@@ -8,7 +8,7 @@ const { Vibrant } = require('node-vibrant/node');
 const app = express();
 app.use(cors());
 
-// Credentials loaded from Railway Environment Variables
+// Credentials loaded from Railway / Server Environment Variables
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
@@ -32,7 +32,42 @@ const rawStreamUrlCache = new Map();
 const subtitleCache = new Map();
 
 // ─────────────────────────────────────────────────────────────
-// 1. TIDAL AUDIO STREAMING
+// 1. CLEAN / EXPLICIT & NORMALIZER HELPERS
+// ─────────────────────────────────────────────────────────────
+
+const CLEAN_REGEX = /\b(clean|clean version|radio edit|radio version|censored)\b/i;
+const EXPLICIT_REGEX = /\b(explicit|dirty|uncensored|unrated)\b/i;
+
+function isCleanTrack(title) {
+  return CLEAN_REGEX.test(title || '');
+}
+
+function isExplicitTrack(title) {
+  return EXPLICIT_REGEX.test(title || '');
+}
+
+function cleanTrackTitle(title) {
+  if (!title) return '';
+  return title
+    .replace(/[-_]/g, ' ')
+    .replace(/\((?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|clean|clean version|radio edit|censored|original mix|10 minute version)[^)]*\)/gi, '')
+    .replace(/\[(?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|clean|clean version|radio edit|censored|original mix|10 minute version)[^\]]*\]/gi, '')
+    .replace(/-\s*(?:remastered|remaster|deluxe|single version|bonus track|live|from the vault|clean|explicit|radio edit).*/gi, '')
+    .replace(/\s+feat\..*/gi, '')
+    .replace(/\s+ft\..*/gi, '')
+    .replace(/\s+with\s+.*/gi, '')
+    .replace(/[^\w\s]/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function cleanString(str) {
+  if (!str) return '';
+  return str.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// ─────────────────────────────────────────────────────────────
+// 2. TIDAL AUDIO STREAMING
 // ─────────────────────────────────────────────────────────────
 
 async function getAccessToken() {
@@ -121,8 +156,12 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
 async function searchTidalForTrack(title, artist) {
   try {
     const token = await getAccessToken();
+    const isClean = isCleanTrack(title);
+    const isExplicit = isExplicitTrack(title);
     const cleanTitle = cleanTrackTitle(title);
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(`${cleanTitle} ${artist}`)}&limit=5&types=TRACKS&countryCode=US`;
+
+    const query = isClean ? `${cleanTitle} ${artist} Clean` : `${cleanTitle} ${artist}`;
+    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(query)}&limit=15&types=TRACKS&countryCode=US`;
 
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
@@ -132,7 +171,26 @@ async function searchTidalForTrack(title, artist) {
     if (searchRes.ok) {
       const searchData = await searchRes.json();
       const rawItems = searchData.tracks?.items || searchData.items || [];
-      if (rawItems.length > 0) return rawItems[0].id;
+      if (rawItems.length > 0) {
+        if (isClean) {
+          const cleanItem = rawItems.find(
+            (t) =>
+              CLEAN_REGEX.test(t.title || '') ||
+              CLEAN_REGEX.test(t.version || '') ||
+              t.explicit === false
+          );
+          if (cleanItem) return cleanItem.id;
+        } else if (isExplicit) {
+          const explicitItem = rawItems.find(
+            (t) =>
+              t.explicit === true ||
+              EXPLICIT_REGEX.test(t.title || '') ||
+              EXPLICIT_REGEX.test(t.version || '')
+          );
+          if (explicitItem) return explicitItem.id;
+        }
+        return rawItems[0].id;
+      }
     }
   } catch (error) {
     console.warn(`[Tidal] Search error: ${error.message}`);
@@ -141,7 +199,7 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. YT-DLP DIRECT STREAM EXTRACTOR
+// 3. YT-DLP DIRECT STREAM & SUBTITLE EXTRACTOR
 // ─────────────────────────────────────────────────────────────
 
 function getStreamUrlFromYtDlp(videoId) {
@@ -200,10 +258,6 @@ async function resolveDirectYouTubeStream(videoId) {
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────
-// 3. POSITIONAL VTT PARSER (SPECIAL TOP/LEFT/RIGHT POSITIONING)
-// ─────────────────────────────────────────────────────────────
-
 function parseVttToPositionalCues(vttText) {
   if (!vttText) return [];
   const lines = vttText.replace(/\r\n/g, '\n').split('\n');
@@ -233,7 +287,6 @@ function parseVttToPositionalCues(vttText) {
 
       const settings = (match[9] || '').toLowerCase();
 
-      // Extract WebVTT vertical line position
       let vertical = 'bottom';
       const lineMatch = settings.match(/line:(-?\d+(?:\.\d+)?%?)/);
       if (lineMatch) {
@@ -250,7 +303,6 @@ function parseVttToPositionalCues(vttText) {
         }
       }
 
-      // Extract WebVTT horizontal alignment & position
       let horizontal = 'center';
       const posMatch = settings.match(/position:(\d+(?:\.\d+)?%?)/);
       const alignMatch = settings.match(/align:(start|left|center|right|end)/);
@@ -298,7 +350,6 @@ function parseVttToPositionalCues(vttText) {
   return cues;
 }
 
-// Extract ONLY creator-uploaded manual subtitles (Excludes auto-generated captions)
 async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
   if (subtitleCache.has(videoId)) {
     return subtitleCache.get(videoId);
@@ -328,7 +379,6 @@ async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
 
       try {
         const metadata = JSON.parse(stdoutData);
-        // Exclusively fetch metadata.subtitles (Creator uploaded) and ignore metadata.automatic_captions
         const subtitles = metadata.subtitles || {};
 
         if (Object.keys(subtitles).length === 0) {
@@ -392,28 +442,8 @@ async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. TITLE & ARTIST NORMALIZER AND STRICT MATCHER
+// 4. SCORING & CLASSIFICATION (WITH CLEAN / EXPLICIT BIAS)
 // ─────────────────────────────────────────────────────────────
-
-function cleanTrackTitle(title) {
-  if (!title) return '';
-  return title
-    .replace(/[-_]/g, ' ')
-    .replace(/\((?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|original mix|10 minute version)[^)]*\)/gi, '')
-    .replace(/\[(?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|original mix|10 minute version)[^\]]*\]/gi, '')
-    .replace(/-\s*(?:remastered|remaster|deluxe|single version|bonus track|live|from the vault).*/gi, '')
-    .replace(/\s+feat\..*/gi, '')
-    .replace(/\s+ft\..*/gi, '')
-    .replace(/\s+with\s+.*/gi, '')
-    .replace(/[^\w\s]/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-function cleanString(str) {
-  if (!str) return '';
-  return str.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
 
 const DISQUALIFY_REGEX = /\b(behind the scenes|making of|bts|in the studio|trailer|teaser|snippet|preview|interview|vlog|track by track|unboxing|promo|commentary|reaction|reacts|review|parody|karaoke|instrumental|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|mashup|without cut scene|no dialogue|fan made|fan edit|remastered & lyrics|hd remastered|& lyrics|with lyrics|w\/ lyrics|color coded|sub español|legendado|4k 60fps)\b/i;
 const LIVE_KEYWORDS_REGEX = /\b(live|unplugged|performance|concert|festival|session|sessions|tour|stage|awards|rehearsal|acoustic|bbc radio|live at|live from|en vivo|ao vivo)\b/i;
@@ -435,7 +465,7 @@ function getYouTubeVideoCategory(videoTitle) {
   return 'OTHER';
 }
 
-function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSec = 0) {
+function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSec = 0, isClean = false, isExplicit = false) {
   const vTitle = (video.title || '').toLowerCase();
   const vAuthor = (video.author || '').toLowerCase();
 
@@ -444,6 +474,10 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
   const rawTarget = (targetTitle || '').toLowerCase();
   const artist = (targetArtist || '').toLowerCase();
 
+  const targetIsClean = isClean || isCleanTrack(rawTarget);
+  const targetIsExplicit = isExplicit || isExplicitTrack(rawTarget);
+
+  // 1. Strict Disqualification
   if (DISQUALIFY_REGEX.test(vTitle) && !DISQUALIFY_REGEX.test(rawTarget)) {
     return -5000;
   }
@@ -451,6 +485,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     return -5000;
   }
 
+  // 2. Mandatory Title Word Verification
   const targetWords = cleanTarget.split(/\s+/).filter((w) => w.length > 1);
   if (targetWords.length > 0) {
     const matchedWords = targetWords.filter((w) => cleanVTitle.includes(w));
@@ -462,12 +497,39 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 
   let score = 0;
 
+  // 3. Exact Substring Match Bonus
   if (cleanVTitle.includes(cleanTarget) || vTitle.includes(cleanTarget)) {
     score += 600;
   } else {
     score += 200;
   }
 
+  // 4. CLEAN VS EXPLICIT SCORING RULES
+  const videoIsClean = CLEAN_REGEX.test(vTitle);
+  const videoIsExplicit = EXPLICIT_REGEX.test(vTitle);
+
+  if (targetIsClean) {
+    if (videoIsClean) {
+      score += 2500; // Dominant boost for clean video
+    }
+    if (videoIsExplicit) {
+      score -= 4000; // Heavy penalty if explicit video returned
+    }
+  } else if (targetIsExplicit) {
+    if (videoIsExplicit) {
+      score += 1500;
+    }
+    if (videoIsClean) {
+      score -= 2000;
+    }
+  } else {
+    // Neither clean nor explicit explicitly specified
+    if (videoIsClean) {
+      score -= 250; // Standard official release preferred over clean radio edits
+    }
+  }
+
+  // 5. Channel Verification
   const artistClean = cleanString(artist);
   const authorClean = cleanString(vAuthor);
 
@@ -482,6 +544,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
     score -= 1500;
   }
 
+  // 6. Category Priority
   const category = getYouTubeVideoCategory(vTitle);
   if (category === 'SHORT_FILM') score += 800;
   else if (category === 'OFFICIAL_VIDEO') score += 1000;
@@ -489,11 +552,13 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
   else if (category === 'VISUALIZER') score += 150;
   else if (category === 'AUDIO') score += 50;
 
+  // 7. Live Penalty
   const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTarget);
   if (!isExplicitlyLive && (LIVE_KEYWORDS_REGEX.test(vTitle) || category === 'LIVE')) {
     score -= 1500;
   }
 
+  // 8. Sanity Check for Extended Fan Loops
   const vSeconds = video.seconds || 0;
   if (targetDurationSec > 0 && vSeconds > 0) {
     if (vSeconds > targetDurationSec * 2.2 + 45 && category !== 'SHORT_FILM') {
@@ -890,7 +955,7 @@ app.get('/api/search', async (req, res) => {
     if (!q) return res.status(400).json({ error: 'Search query required.' });
 
     const token = await getAccessToken();
-    const searchRes = await fetch(`https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=10&types=TRACKS&countryCode=US`, {
+    const searchRes = await fetch(`https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=20&types=TRACKS&countryCode=US`, {
       headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
       signal: AbortSignal.timeout(5000),
     });
@@ -906,6 +971,8 @@ app.get('/api/search', async (req, res) => {
       album: t.album?.title || 'Unknown Album',
       coverUrl: t.album?.cover ? `https://resources.tidal.com/images/${t.album.cover.replace(/-/g, '/')}/320x320.jpg` : null,
       duration: t.duration || 0,
+      explicit: !!t.explicit,
+      version: t.version || null,
     }));
 
     res.json({ tracks });
@@ -1006,22 +1073,24 @@ app.get('/api/subtitles', async (req, res) => {
 // YouTube Video Search
 app.get('/api/search-video', async (req, res) => {
   try {
-    const { q, duration } = req.query;
+    const { q, duration, clean } = req.query;
     if (!q) return res.status(400).json({ error: 'Search query required.' });
 
     const host = req.get('host');
     const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
     const baseUrl = `${protocol}://${host}`;
 
+    const isClean = clean === 'true' || isCleanTrack(q);
     const cleanQ = cleanTrackTitle(q);
     const targetDurationSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
-    const rawVideos = await searchYouTubeNative(`${cleanQ} official music video`);
+    const searchQuery = isClean ? `${cleanQ} clean official music video` : `${cleanQ} official music video`;
+    const rawVideos = await searchYouTubeNative(searchQuery);
 
     const scoredVideos = rawVideos
       .map((v) => {
         const category = getYouTubeVideoCategory(v.title);
-        const score = getYouTubeVideoScore(v, cleanQ, '', targetDurationSec);
+        const score = getYouTubeVideoScore(v, cleanQ, '', targetDurationSec, isClean, false);
         return {
           id: v.videoId,
           title: v.title,
@@ -1072,24 +1141,39 @@ app.get('/api/video', async (req, res) => {
 // Official Matched YouTube Video (Music Video / Short Film / Lyric Video)
 app.get('/api/official-video', async (req, res) => {
   try {
-    const { title, artist, duration, preferType } = req.query;
+    const { title, artist, duration, preferType, clean } = req.query;
     if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
 
     const host = req.get('host');
     const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
     const baseUrl = `${protocol}://${host}`;
 
+    const isClean = clean === 'true' || isCleanTrack(title);
+    const isExplicit = clean === 'false' || isExplicitTrack(title);
+
     const cleanTitle = cleanTrackTitle(title);
     const cleanArtist = cleanTrackTitle(artist);
     const audioDurSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
-    const queries = [
-      `${cleanTitle} ${cleanArtist} official music video`,
-      `${cleanArtist} ${cleanTitle} official`,
-      `${cleanArtist} ${cleanTitle} vevo`,
-      `${cleanTitle} ${cleanArtist} short film`,
-      `${cleanTitle} ${cleanArtist} lyric video`,
-    ];
+    let queries = [];
+    if (isClean) {
+      queries = [
+        `${cleanTitle} ${cleanArtist} clean official music video`,
+        `${cleanTitle} ${cleanArtist} clean official video`,
+        `${cleanTitle} ${cleanArtist} clean version`,
+        `${cleanTitle} ${cleanArtist} radio edit official video`,
+        `${cleanTitle} ${cleanArtist} clean lyric video`,
+        `${cleanTitle} ${cleanArtist} official music video`,
+      ];
+    } else {
+      queries = [
+        `${cleanTitle} ${cleanArtist} official music video`,
+        `${cleanArtist} ${cleanTitle} official`,
+        `${cleanArtist} ${cleanTitle} vevo`,
+        `${cleanTitle} ${cleanArtist} short film`,
+        `${cleanTitle} ${cleanArtist} lyric video`,
+      ];
+    }
 
     const responses = await Promise.all(queries.map((q) => searchYouTubeNative(q)));
 
@@ -1110,7 +1194,7 @@ app.get('/api/official-video', async (req, res) => {
     }
 
     const scoredList = candidateVideos.map((v) => {
-      let score = getYouTubeVideoScore(v, cleanTitle, cleanArtist, audioDurSec);
+      let score = getYouTubeVideoScore(v, title, cleanArtist, audioDurSec, isClean, isExplicit);
       const category = getYouTubeVideoCategory(v.title);
 
       if (preferType && category === preferType.toUpperCase()) {
