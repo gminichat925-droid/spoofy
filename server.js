@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
+const { spawn } = require('child_process');
 const { Vibrant } = require('node-vibrant/node');
 
 const app = express();
@@ -139,17 +140,45 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. HIGH-RELIABILITY YOUTUBE STREAM EXTRACTOR (PIPED + HLS)
+// 2. YT-DLP DIRECT STREAM EXTRACTOR
 // ─────────────────────────────────────────────────────────────
 
-const PIPED_INSTANCES = [
-  'https://api.piped.private.coffee',
-  'https://pipedapi.tokhmi.xyz',
-  'https://pipedapi.kavin.rocks',
-  'https://api.piped.yt',
-  'https://pipedapi.in.projectsegfau.lt',
-  'https://pa.il.ax'
-];
+function getStreamUrlFromYtDlp(videoId) {
+  return new Promise((resolve, reject) => {
+    // Prefer muxed 720p/480p mp4 for mobile streaming
+    const ytProcess = spawn('yt-dlp', [
+      '-g',
+      '-f', '18/22/best[ext=mp4][height<=720]/best[height<=720]/best',
+      '--no-warnings',
+      '--no-playlist',
+      `https://www.youtube.com/watch?v=${videoId}`,
+    ]);
+
+    let stdoutData = '';
+    let stderrData = '';
+
+    ytProcess.stdout.on('data', (chunk) => {
+      stdoutData += chunk.toString();
+    });
+
+    ytProcess.stderr.on('data', (chunk) => {
+      stderrData += chunk.toString();
+    });
+
+    ytProcess.on('close', (code) => {
+      if (code === 0 && stdoutData.trim()) {
+        const streamUrl = stdoutData.trim().split('\n')[0];
+        resolve(streamUrl);
+      } else {
+        reject(new Error(stderrData || `yt-dlp exited with code ${code}`));
+      }
+    });
+
+    ytProcess.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
 
 async function resolveDirectYouTubeStream(videoId) {
   if (rawStreamUrlCache.has(videoId)) {
@@ -157,95 +186,15 @@ async function resolveDirectYouTubeStream(videoId) {
     if (Date.now() < cached.expiresAt) return cached.url;
   }
 
-  // Tier 1: Query Piped API Nodes for Direct HLS / Stream URLs
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      const res = await fetch(`${instance}/streams/${videoId}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-        signal: AbortSignal.timeout(3500),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        
-        // 1. Direct HLS Master Playlist (Fastest & best quality for expo-video)
-        if (data.hls) {
-          rawStreamUrlCache.set(videoId, { url: data.hls, expiresAt: Date.now() + 1800000 });
-          return data.hls;
-        }
-
-        // 2. Direct Video + Audio MP4 Streams
-        const streams = (data.videoStreams || []).filter(s => s.url && !s.videoOnly);
-        if (streams.length > 0) {
-          // Sort by highest resolution (720p > 480p > 360p)
-          streams.sort((a, b) => (parseInt(b.quality, 10) || 0) - (parseInt(a.quality, 10) || 0));
-          const bestUrl = streams[0].url;
-          rawStreamUrlCache.set(videoId, { url: bestUrl, expiresAt: Date.now() + 1800000 });
-          return bestUrl;
-        }
-      }
-    } catch (err) {}
-  }
-
-  // Tier 2: Invidious Proxy Stream Fallback
-  const INVIDIOUS_INSTANCES = [
-    'https://inv.nadeko.net',
-    'https://invidious.nerdvpn.de',
-    'https://invidious.tiekoetter.com',
-    'https://invidious.f5.si'
-  ];
-
-  for (const instance of INVIDIOUS_INSTANCES) {
-    try {
-      const res = await fetch(`${instance}/api/v1/videos/${videoId}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(3500),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.hlsUrl) {
-          rawStreamUrlCache.set(videoId, { url: data.hlsUrl, expiresAt: Date.now() + 1800000 });
-          return data.hlsUrl;
-        }
-
-        const formats = (data.formatStreams || []).filter(f => f.url);
-        if (formats.length > 0) {
-          formats.sort((a, b) => (parseInt(b.qualityLabel, 10) || 0) - (parseInt(a.qualityLabel, 10) || 0));
-          const best = formats[0].url;
-          rawStreamUrlCache.set(videoId, { url: best, expiresAt: Date.now() + 1800000 });
-          return best;
-        }
-      }
-    } catch (err) {}
-  }
-
-  // Tier 3: InnerTube Android Client Fallback
   try {
-    const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11; US)',
-      },
-      body: JSON.stringify({
-        videoId,
-        context: { client: { clientName: 'ANDROID', clientVersion: '19.09.37', androidSdkVersion: 30, hl: 'en', gl: 'US' } },
-      }),
-      signal: AbortSignal.timeout(4000),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data.streamingData?.hlsManifestUrl) {
-        return data.streamingData.hlsManifestUrl;
-      }
-      const formats = (data.streamingData?.formats || []).filter((f) => f.url);
-      if (formats.length > 0) {
-        return formats[0].url;
-      }
+    const directUrl = await getStreamUrlFromYtDlp(videoId);
+    if (directUrl) {
+      rawStreamUrlCache.set(videoId, { url: directUrl, expiresAt: Date.now() + 3600000 });
+      return directUrl;
     }
-  } catch (err) {}
+  } catch (err) {
+    console.error(`[yt-dlp Extraction Error for ${videoId}]:`, err.message);
+  }
 
   return null;
 }
@@ -790,7 +739,7 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// YouTube Video Byte-Range Stream Proxy (For expo-video)
+// YouTube Video Stream Proxy (yt-dlp Stream Proxy with Byte-Range support)
 app.get('/api/yt-stream', async (req, res) => {
   try {
     const { videoId } = req.query;
@@ -798,7 +747,7 @@ app.get('/api/yt-stream', async (req, res) => {
 
     const rawUrl = await resolveDirectYouTubeStream(videoId);
     if (!rawUrl) {
-      return res.status(404).json({ error: 'Failed to resolve YouTube media stream.' });
+      return res.status(404).json({ error: 'Failed to resolve YouTube media stream with yt-dlp.' });
     }
 
     const clientRange = req.headers.range || 'bytes=0-';
