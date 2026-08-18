@@ -138,14 +138,128 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. ZERO-DEPENDENCY YOUTUBE SEARCH & PARSER
+// 2. YOUTUBE DIRECT STREAM EXTRACTOR (NATIVE INNER-TUBE API)
+// ─────────────────────────────────────────────────────────────
+
+async function getYouTubeDirectStreamUrl(videoId) {
+  if (!videoId) return null;
+
+  // Primary: Android Client (Fetches direct HLS master .m3u8 or muxed MP4s)
+  try {
+    const payload = {
+      videoId: videoId,
+      context: {
+        client: {
+          clientName: 'ANDROID',
+          clientVersion: '19.09.37',
+          androidSdkVersion: 30,
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+    };
+
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11; US) gzip',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const streamingData = data.streamingData;
+      if (streamingData) {
+        if (streamingData.hlsManifestUrl) {
+          return streamingData.hlsManifestUrl;
+        }
+
+        const formats = streamingData.formats || [];
+        const muxed = formats.filter((f) => f.url && f.mimeType && f.mimeType.includes('video/mp4'));
+        if (muxed.length > 0) {
+          muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
+          return muxed[0].url;
+        }
+
+        const anyWithUrl = formats.find((f) => f.url);
+        if (anyWithUrl) return anyWithUrl.url;
+      }
+    }
+  } catch (err) {
+    console.warn(`[YouTube Stream Extractor Android Error] ${videoId}: ${err.message}`);
+  }
+
+  // Secondary: iOS Client Fallback
+  try {
+    const payload = {
+      videoId: videoId,
+      context: {
+        client: {
+          clientName: 'IOS',
+          clientVersion: '19.29.1',
+          deviceModel: 'iPhone14,3',
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+    };
+
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone14,3; U; CPU iOS 17_5_1 like Mac OS X; en_US)',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const streamingData = data.streamingData;
+      if (streamingData) {
+        if (streamingData.hlsManifestUrl) return streamingData.hlsManifestUrl;
+        const formats = streamingData.formats || [];
+        const muxed = formats.filter((f) => f.url && f.mimeType && f.mimeType.includes('video/mp4'));
+        if (muxed.length > 0) {
+          muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
+          return muxed[0].url;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[YouTube Stream Extractor iOS Error] ${videoId}: ${err.message}`);
+  }
+
+  // Tertiary: Invidious CDN Fallback
+  try {
+    const invRes = await fetch(`https://inv.nadeko.net/api/v1/videos/${videoId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (invRes.ok) {
+      const invData = await invRes.json();
+      if (invData.hlsUrl) return invData.hlsUrl;
+      const format = invData.formatStreams?.slice(-1)[0];
+      if (format?.url) return format.url;
+    }
+  } catch (err) {}
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 3. ZERO-DEPENDENCY YOUTUBE SEARCH & PARSER
 // ─────────────────────────────────────────────────────────────
 
 function parseDurationToSeconds(durationStr) {
   if (!durationStr || typeof durationStr !== 'string') return 0;
   const parts = durationStr.split(':').map(Number);
-  if (parts.length === 2) return (parts[0] * 60) + parts[1];
-  if (parts.length === 3) return (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   return 0;
 }
 
@@ -163,8 +277,9 @@ async function searchYouTubeNative(query) {
     if (!res.ok) return [];
     const html = await res.text();
 
-    const dataMatch = html.match(/var ytInitialData\s*=\s*({.+?});<\/script>/s) ||
-                      html.match(/window\["ytInitialData"\]\s*=\s*({.+?});<\/script>/s);
+    const dataMatch =
+      html.match(/var ytInitialData\s*=\s*({.+?});<\/script>/s) ||
+      html.match(/window\["ytInitialData"\]\s*=\s*({.+?});<\/script>/s);
 
     if (!dataMatch) return [];
 
@@ -184,7 +299,7 @@ async function searchYouTubeNative(query) {
             author: v.ownerText?.runs?.[0]?.text || '',
             seconds: parseDurationToSeconds(durationText),
             thumbnail: v.thumbnail?.thumbnails?.slice(-1)[0]?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
-            description: v.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map(r => r.text).join('') || '',
+            description: v.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map((r) => r.text).join('') || '',
           });
         }
       }
@@ -198,7 +313,7 @@ async function searchYouTubeNative(query) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. TITLE NORMALIZER & MULTI-TIER CLASSIFIER
+// 4. TITLE NORMALIZER & MULTI-TIER CLASSIFIER
 // ─────────────────────────────────────────────────────────────
 
 function cleanTrackTitle(title) {
@@ -295,7 +410,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. SPONSORBLOCK INTRO OFFSET ENGINE
+// 5. SPONSORBLOCK INTRO OFFSET ENGINE
 // ─────────────────────────────────────────────────────────────
 
 async function getSponsorBlockIntroOffset(ytVideoId) {
@@ -306,7 +421,7 @@ async function getSponsorBlockIntroOffset(ytVideoId) {
 
     const segments = await res.json();
     if (Array.isArray(segments)) {
-      const intro = segments.find(s => Array.isArray(s.segment) && s.segment[0] <= 3);
+      const intro = segments.find((s) => Array.isArray(s.segment) && s.segment[0] <= 3);
       if (intro && intro.segment[1] > 2) {
         return Number(intro.segment[1].toFixed(2));
       }
@@ -346,7 +461,7 @@ async function getAccurateVideoIntroOffset(title, artist, ytVideoId, videoDurati
 }
 
 // ─────────────────────────────────────────────────────────────
-// 5. APPLE MOTION & LYRICS
+// 6. APPLE MOTION & SPOTIFY / LRCLIB LYRICS
 // ─────────────────────────────────────────────────────────────
 
 async function getAppleDeveloperToken() {
@@ -436,7 +551,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
         const albums = searchData.results?.albums?.data || [];
         let targetAlbum = albums[0];
         if (isTaylorVersion) {
-          const match = albums.find(a => /taylor's version/i.test(a.attributes?.name || ''));
+          const match = albums.find((a) => /taylor's version/i.test(a.attributes?.name || ''));
           if (match) targetAlbum = match;
         }
 
@@ -470,7 +585,7 @@ async function getAppleMotionUrl(albumTitle, artistName) {
 
       let targetAlbum = results[0];
       if (isTaylorVersion) {
-        const match = results.find(a => /taylor's version/i.test(a.collectionName || ''));
+        const match = results.find((a) => /taylor's version/i.test(a.collectionName || ''));
         if (match) targetAlbum = match;
       }
 
@@ -550,7 +665,7 @@ async function getSpotifyLyrics(title, artist) {
     let lrcString = '';
     let plainString = '';
 
-    spotifyLyrics.lines.forEach(line => {
+    spotifyLyrics.lines.forEach((line) => {
       plainString += line.words + '\n';
       if (!line.startTimeMs) return;
       const lineTime = parseInt(line.startTimeMs, 10);
@@ -559,7 +674,7 @@ async function getSpotifyLyrics(title, artist) {
       let lineContent = '';
 
       if (isWordByWord && line.syllables && line.syllables.length > 0) {
-        line.syllables.forEach(syllable => {
+        line.syllables.forEach((syllable) => {
           const sylTime = parseInt(syllable.startTimeMs, 10);
           if (!isNaN(sylTime)) {
             const sMins = String(Math.floor(sylTime / 60000)).padStart(2, '0');
@@ -595,10 +710,10 @@ async function getLrclibLyrics(title, artist) {
       const results = await res.json();
       if (results && results.length > 0) {
         const enhancedLrcRegex = /<\d{2}:\d{2}\.\d{2,3}>/;
-        const wordByWordMatch = results.find(r => r.syncedLyrics && enhancedLrcRegex.test(r.syncedLyrics));
+        const wordByWordMatch = results.find((r) => r.syncedLyrics && enhancedLrcRegex.test(r.syncedLyrics));
         if (wordByWordMatch) return { ...wordByWordMatch, isWordByWord: true };
 
-        const lineByLineMatch = results.find(r => r.syncedLyrics);
+        const lineByLineMatch = results.find((r) => r.syncedLyrics);
         if (lineByLineMatch) return { ...lineByLineMatch, isWordByWord: false };
 
         return { ...results[0], isWordByWord: false };
@@ -609,7 +724,7 @@ async function getLrclibLyrics(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 6. API ENDPOINTS
+// 7. API ENDPOINTS
 // ─────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
@@ -665,7 +780,7 @@ app.get('/api/stream', async (req, res) => {
 
     const tidalResponse = await fetch(directStreamUrl, {
       headers: { 'Range': clientRange },
-      signal: controller.signal
+      signal: controller.signal,
     });
 
     res.status(tidalResponse.status);
@@ -720,23 +835,31 @@ app.get('/api/search-video', async (req, res) => {
   }
 });
 
-// YouTube Video Embed / Info
+// YouTube Video Details & Direct Media Stream
 app.get('/api/video', async (req, res) => {
   try {
     const { videoId } = req.query;
     if (!videoId) return res.status(400).json({ error: 'videoId is required' });
 
-    const sbOffset = await getSponsorBlockIntroOffset(videoId);
+    const [directStreamUrl, sbOffset] = await Promise.all([
+      getYouTubeDirectStreamUrl(videoId),
+      getSponsorBlockIntroOffset(videoId),
+    ]);
+
+    if (!directStreamUrl) {
+      return res.status(404).json({ success: false, error: 'Could not extract playable stream URL.' });
+    }
 
     res.json({
       success: true,
       videoId: videoId,
+      videoUrl: directStreamUrl, // Direct .m3u8 / .mp4 media stream for expo-video
+      startOffset: sbOffset || 0,
       embedUrl: `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1`,
       watchUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      startOffset: sbOffset || 0
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -755,7 +878,7 @@ app.get('/api/official-video', async (req, res) => {
       `${cleanTitle} ${artist} lyric video`,
     ];
 
-    const responses = await Promise.all(queries.map(q => searchYouTubeNative(q)));
+    const responses = await Promise.all(queries.map((q) => searchYouTubeNative(q)));
 
     const seenIds = new Set();
     const candidateVideos = [];
@@ -792,11 +915,15 @@ app.get('/api/official-video', async (req, res) => {
     }
 
     const bestVideo = topMatch.video;
-    const startOffset = await getAccurateVideoIntroOffset(title, artist, bestVideo.videoId, bestVideo.seconds, audioDurSec);
+    const [directStreamUrl, startOffset] = await Promise.all([
+      getYouTubeDirectStreamUrl(bestVideo.videoId),
+      getAccurateVideoIntroOffset(title, artist, bestVideo.videoId, bestVideo.seconds, audioDurSec),
+    ]);
 
     res.json({
       found: true,
       videoId: bestVideo.videoId,
+      videoUrl: directStreamUrl, // Direct stream for expo-video
       title: bestVideo.title,
       artist: bestVideo.author || artist,
       duration: bestVideo.seconds,
@@ -804,7 +931,7 @@ app.get('/api/official-video', async (req, res) => {
       category: topMatch.category,
       startOffset: startOffset,
       embedUrl: `https://www.youtube-nocookie.com/embed/${bestVideo.videoId}?autoplay=1&enablejsapi=1`,
-      watchUrl: `https://www.youtube.com/watch?v=${bestVideo.videoId}`
+      watchUrl: `https://www.youtube.com/watch?v=${bestVideo.videoId}`,
     });
   } catch (error) {
     console.error('[Official Video Error]', error.message);
@@ -827,7 +954,7 @@ app.get('/api/motion', async (req, res) => {
     }
 
     const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), 3500));
-    const motionUrl = await Promise.race([ getAppleMotionUrl(album, artist), timeoutPromise ]);
+    const motionUrl = await Promise.race([getAppleMotionUrl(album, artist), timeoutPromise]);
 
     res.json({
       hasMotion: !!motionUrl,
