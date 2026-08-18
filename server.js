@@ -140,12 +140,11 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. YT-DLP DIRECT STREAM EXTRACTOR (MOBILE CLIENTS)
+// 2. YT-DLP DIRECT STREAM EXTRACTOR
 // ─────────────────────────────────────────────────────────────
 
 function getStreamUrlFromYtDlp(videoId) {
   return new Promise((resolve, reject) => {
-    // Uses android,ios,web_safari player clients to bypass web reload bot challenges
     const ytProcess = spawn('yt-dlp', [
       '-g',
       '-f', '18/22/b[ext=mp4][height<=720]/best[height<=720]/best',
@@ -207,12 +206,14 @@ async function resolveDirectYouTubeStream(videoId) {
 function cleanTrackTitle(title) {
   if (!title) return '';
   return title
+    .replace(/[-_]/g, ' ') // Convert hyphens and underscores to spaces
     .replace(/\((?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|original mix|10 minute version)[^)]*\)/gi, '')
     .replace(/\[(?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|original mix|10 minute version)[^\]]*\]/gi, '')
     .replace(/-\s*(?:remastered|remaster|deluxe|single version|bonus track|live|from the vault).*/gi, '')
     .replace(/\s+feat\..*/gi, '')
     .replace(/\s+ft\..*/gi, '')
     .replace(/\s+with\s+.*/gi, '')
+    .replace(/[^\w\s]/gi, '') // Remove symbols
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
@@ -242,24 +243,44 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
   const vAuthor = (video.author || '').toLowerCase();
 
   const cleanTarget = cleanTrackTitle(targetTitle).toLowerCase();
+  const cleanVTitle = cleanTrackTitle(vTitle).toLowerCase();
   const rawTarget = (targetTitle || '').toLowerCase();
   const artist = (targetArtist || '').toLowerCase();
 
+  // 1. Disqualification checks
   if (DISQUALIFY_REGEX.test(vTitle) && !DISQUALIFY_REGEX.test(rawTarget)) {
     return -5000;
   }
-
   if (video.seconds && video.seconds < 45) {
     return -5000;
   }
 
+  // 2. Mandatory Title Token Verification
+  // If the target title words do NOT match the video title, drop immediately.
+  const targetWords = cleanTarget.split(/\s+/).filter((w) => w.length > 1);
+  if (targetWords.length > 0) {
+    const matchedWords = targetWords.filter((w) => cleanVTitle.includes(w));
+    const matchRatio = matchedWords.length / targetWords.length;
+    if (matchRatio < 0.6) {
+      return -5000; // Complete mismatch (e.g., "Hot N Cold" when searching "Thinking of You")
+    }
+  }
+
   let score = 0;
 
+  // 3. Exact Substring Match Bonus
+  if (cleanVTitle.includes(cleanTarget) || vTitle.includes(cleanTarget)) {
+    score += 600;
+  } else {
+    score += 200;
+  }
+
+  // 4. Channel Verification
   if (artist) {
-    if (vAuthor.includes(artist) || artist.includes(vAuthor)) {
-      score += 500;
+    if (vAuthor.includes(artist) || artist.includes(vAuthor) || vTitle.includes(artist)) {
+      score += 400;
     } else {
-      score -= 400;
+      score -= 300;
     }
   }
 
@@ -267,13 +288,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
     score += 300;
   }
 
-  const cleanVTitle = cleanTrackTitle(vTitle).toLowerCase();
-  if (cleanVTitle.includes(cleanTarget) || vTitle.includes(cleanTarget)) {
-    score += 400;
-  } else {
-    score -= 500;
-  }
-
+  // 5. Category Priority
   const category = getYouTubeVideoCategory(vTitle);
   if (category === 'SHORT_FILM') score += 800;
   else if (category === 'OFFICIAL_VIDEO') score += 1000;
@@ -281,9 +296,10 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
   else if (category === 'VISUALIZER') score += 150;
   else if (category === 'AUDIO') score += 50;
 
+  // 6. Live Penalty
   const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTarget);
   if (!isExplicitlyLive && (LIVE_KEYWORDS_REGEX.test(vTitle) || category === 'LIVE')) {
-    score -= 1200;
+    score -= 1500;
   }
 
   return score;
@@ -592,7 +608,7 @@ async function getSpotifyLyrics(title, artist) {
     const trackId = searchData.tracks?.items?.[0]?.id;
     if (!trackId) return null;
 
-    const lyricsRes = await fetch(`https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&market=from_token`, {
+    const lyricsRes = await fetch(`https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&market=from-token`, {
       headers: { 'App-Platform': 'WebPlayer', 'Authorization': `Bearer ${token}` },
       signal: AbortSignal.timeout(4000),
     });
@@ -740,7 +756,7 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-// YouTube Video Byte-Range Stream Proxy (yt-dlp Stream Proxy with Byte-Range support)
+// YouTube Video Byte-Range Stream Proxy (yt-dlp Stream Proxy)
 app.get('/api/yt-stream', async (req, res) => {
   try {
     const { videoId } = req.query;
@@ -855,13 +871,15 @@ app.get('/api/official-video', async (req, res) => {
     const baseUrl = `${protocol}://${host}`;
 
     const cleanTitle = cleanTrackTitle(title);
+    const cleanArtist = cleanTrackTitle(artist);
     const audioDurSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
     const queries = [
-      `${cleanTitle} ${artist} official music video`,
-      `${artist} ${cleanTitle} vevo`,
-      `${cleanTitle} ${artist} short film`,
-      `${cleanTitle} ${artist} lyric video`,
+      `${cleanTitle} ${cleanArtist} official music video`,
+      `${cleanArtist} ${cleanTitle} official video`,
+      `${cleanArtist} ${cleanTitle} vevo`,
+      `${cleanTitle} ${cleanArtist} short film`,
+      `${cleanTitle} ${cleanArtist} lyric video`,
     ];
 
     const responses = await Promise.all(queries.map((q) => searchYouTubeNative(q)));
@@ -883,7 +901,7 @@ app.get('/api/official-video', async (req, res) => {
     }
 
     const scoredList = candidateVideos.map((v) => {
-      let score = getYouTubeVideoScore(v, title, artist);
+      let score = getYouTubeVideoScore(v, cleanTitle, cleanArtist);
       const category = getYouTubeVideoCategory(v.title);
 
       if (preferType && category === preferType.toUpperCase()) {
@@ -901,7 +919,7 @@ app.get('/api/official-video', async (req, res) => {
     }
 
     const bestVideo = topMatch.video;
-    const startOffset = await getAccurateVideoIntroOffset(title, artist, bestVideo.videoId, bestVideo.seconds, audioDurSec);
+    const startOffset = await getAccurateVideoIntroOffset(cleanTitle, cleanArtist, bestVideo.videoId, bestVideo.seconds, audioDurSec);
 
     res.json({
       found: true,
