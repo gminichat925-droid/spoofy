@@ -200,28 +200,33 @@ async function resolveDirectYouTubeStream(videoId) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. TITLE NORMALIZER & STRICT CLASSIFIER / SCORER
+// 3. TITLE & ARTIST NORMALIZER AND STRICT MATCHER
 // ─────────────────────────────────────────────────────────────
 
 function cleanTrackTitle(title) {
   if (!title) return '';
   return title
-    .replace(/[-_]/g, ' ') // Convert hyphens and underscores to spaces
+    .replace(/[-_]/g, ' ')
     .replace(/\((?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|original mix|10 minute version)[^)]*\)/gi, '')
     .replace(/\[(?:taylor's version|from the vault|deluxe|remastered|remaster|bonus track|single version|anniversary|expanded|explicit|original mix|10 minute version)[^\]]*\]/gi, '')
     .replace(/-\s*(?:remastered|remaster|deluxe|single version|bonus track|live|from the vault).*/gi, '')
     .replace(/\s+feat\..*/gi, '')
     .replace(/\s+ft\..*/gi, '')
     .replace(/\s+with\s+.*/gi, '')
-    .replace(/[^\w\s]/gi, '') // Remove symbols
+    .replace(/[^\w\s]/gi, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
 
-const DISQUALIFY_REGEX = /\b(behind the scenes|making of|bts|in the studio|trailer|teaser|snippet|preview|interview|vlog|track by track|unboxing|promo|commentary|reaction|reacts|review|parody|karaoke|instrumental|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|mashup|without cut scene|no dialogue|fan made|fan edit)\b/i;
+function cleanString(str) {
+  if (!str) return '';
+  return str.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+const DISQUALIFY_REGEX = /\b(behind the scenes|making of|bts|in the studio|trailer|teaser|snippet|preview|interview|vlog|track by track|unboxing|promo|commentary|reaction|reacts|review|parody|karaoke|instrumental|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|mashup|without cut scene|no dialogue|fan made|fan edit|remastered & lyrics|hd remastered|& lyrics|with lyrics|w\/ lyrics|color coded|sub español|legendado|4k 60fps)\b/i;
 const LIVE_KEYWORDS_REGEX = /\b(live|unplugged|performance|concert|festival|session|sessions|tour|stage|awards|rehearsal|acoustic|bbc radio|live at|live from|en vivo|ao vivo)\b/i;
 const SHORT_FILM_REGEX = /\b(short film|the short film|directors cut|director's cut|extended cut|the movie|cinematic video)\b/i;
-const OFFICIAL_MV_REGEX = /\b(official music video|official video|\(official video\)|\(official music video\)|\[official music video\]|\[official video\]|\bm\/v\b|\b\(mv\)\b|official visual album)\b/i;
+const OFFICIAL_MV_REGEX = /\b(official music video|official video|\(official video\)|\(official music video\)|\[official music video\]|\[official video\]|\(official\)|\[official\]|\bm\/v\b|\b\(mv\)\b|official visual album)\b/i;
 const LYRIC_KEYWORDS_REGEX = /\b(official lyric video|official lyrics|lyric video|lyrics video|lyric|lyrics)\b/i;
 const VISUALIZER_REGEX = /\b(official visualizer|visualizer|audio video|track video)\b/i;
 const AUDIO_ONLY_REGEX = /\b(official audio|audio|topic)\b/i;
@@ -238,7 +243,7 @@ function getYouTubeVideoCategory(videoTitle) {
   return 'OTHER';
 }
 
-function getYouTubeVideoScore(video, targetTitle, targetArtist) {
+function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSec = 0) {
   const vTitle = (video.title || '').toLowerCase();
   const vAuthor = (video.author || '').toLowerCase();
 
@@ -247,7 +252,7 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
   const rawTarget = (targetTitle || '').toLowerCase();
   const artist = (targetArtist || '').toLowerCase();
 
-  // 1. Disqualification checks
+  // 1. Strict Disqualification
   if (DISQUALIFY_REGEX.test(vTitle) && !DISQUALIFY_REGEX.test(rawTarget)) {
     return -5000;
   }
@@ -255,14 +260,13 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
     return -5000;
   }
 
-  // 2. Mandatory Title Token Verification
-  // If the target title words do NOT match the video title, drop immediately.
+  // 2. Mandatory Title Word Verification
   const targetWords = cleanTarget.split(/\s+/).filter((w) => w.length > 1);
   if (targetWords.length > 0) {
     const matchedWords = targetWords.filter((w) => cleanVTitle.includes(w));
     const matchRatio = matchedWords.length / targetWords.length;
     if (matchRatio < 0.6) {
-      return -5000; // Complete mismatch (e.g., "Hot N Cold" when searching "Thinking of You")
+      return -5000; // Complete mismatch
     }
   }
 
@@ -275,17 +279,19 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
     score += 200;
   }
 
-  // 4. Channel Verification
-  if (artist) {
-    if (vAuthor.includes(artist) || artist.includes(vAuthor) || vTitle.includes(artist)) {
-      score += 400;
-    } else {
-      score -= 300;
-    }
-  }
+  // 4. Channel Verification (Strict: Must be the actual artist's channel)
+  const artistClean = cleanString(artist);
+  const authorClean = cleanString(vAuthor);
 
-  if (vAuthor.includes('vevo') || vAuthor.includes('official')) {
-    score += 300;
+  const isAuthorMatch =
+    authorClean.includes(artistClean) ||
+    artistClean.includes(authorClean) ||
+    (vAuthor.includes('vevo') && artist.split(' ').some((part) => vAuthor.includes(part.toLowerCase())));
+
+  if (isAuthorMatch) {
+    score += 1500; // Huge boost for the verified artist/VEVO channel
+  } else {
+    score -= 1500; // Heavy penalty for 3rd-party fan uploaders (like Nova Tracks)
   }
 
   // 5. Category Priority
@@ -300,6 +306,14 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist) {
   const isExplicitlyLive = LIVE_KEYWORDS_REGEX.test(rawTarget);
   if (!isExplicitlyLive && (LIVE_KEYWORDS_REGEX.test(vTitle) || category === 'LIVE')) {
     score -= 1500;
+  }
+
+  // 7. Sanity Check for Extended Fan Loops (e.g. 529s for a 200s song)
+  const vSeconds = video.seconds || 0;
+  if (targetDurationSec > 0 && vSeconds > 0) {
+    if (vSeconds > targetDurationSec * 2.2 + 45 && category !== 'SHORT_FILM') {
+      score -= 2500; // Over twice the song duration
+    }
   }
 
   return score;
@@ -806,13 +820,14 @@ app.get('/api/search-video', async (req, res) => {
     const baseUrl = `${protocol}://${host}`;
 
     const cleanQ = cleanTrackTitle(q);
+    const targetDurationSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
     const rawVideos = await searchYouTubeNative(`${cleanQ} official music video`);
 
     const scoredVideos = rawVideos
       .map((v) => {
         const category = getYouTubeVideoCategory(v.title);
-        const score = getYouTubeVideoScore(v, cleanQ, '');
+        const score = getYouTubeVideoScore(v, cleanQ, '', targetDurationSec);
         return {
           id: v.videoId,
           title: v.title,
@@ -876,7 +891,7 @@ app.get('/api/official-video', async (req, res) => {
 
     const queries = [
       `${cleanTitle} ${cleanArtist} official music video`,
-      `${cleanArtist} ${cleanTitle} official video`,
+      `${cleanArtist} ${cleanTitle} official`,
       `${cleanArtist} ${cleanTitle} vevo`,
       `${cleanTitle} ${cleanArtist} short film`,
       `${cleanTitle} ${cleanArtist} lyric video`,
@@ -901,7 +916,7 @@ app.get('/api/official-video', async (req, res) => {
     }
 
     const scoredList = candidateVideos.map((v) => {
-      let score = getYouTubeVideoScore(v, cleanTitle, cleanArtist);
+      let score = getYouTubeVideoScore(v, cleanTitle, cleanArtist, audioDurSec);
       const category = getYouTubeVideoCategory(v.title);
 
       if (preferType && category === preferType.toUpperCase()) {
