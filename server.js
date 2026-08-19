@@ -161,14 +161,13 @@ async function searchTidalForTrack(title, artist, album = '', isClean = false) {
     const cleanAlbum = cleanTrackTitle(album);
 
     const searchQueries = [
-      isClean ? `${cleanTitle} ${cleanArtist} Clean` : null,
-      cleanAlbum ? `${cleanTitle} ${cleanArtist} ${cleanAlbum}` : null,
       `${cleanTitle} ${cleanArtist}`,
-    ].filter(Boolean);
+      cleanTitle,
+    ];
 
     const allTracks = [];
     for (const q of searchQueries) {
-      const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=15&types=TRACKS&countryCode=US`;
+      const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=25&types=TRACKS&countryCode=US`;
       const searchRes = await fetch(searchUrl, {
         headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
         signal: AbortSignal.timeout(5000),
@@ -186,52 +185,74 @@ async function searchTidalForTrack(title, artist, album = '', isClean = false) {
     // Deduplicate candidates
     const seen = new Set();
     const uniqueTracks = allTracks.filter((t) => {
-      if (seen.has(t.id)) return false;
+      if (!t || !t.id || seen.has(t.id)) return false;
       seen.add(t.id);
       return true;
     });
 
-    // Score Tidal candidates
-    const scored = uniqueTracks.map((t) => {
-      let score = 0;
-      const tTitle = cleanTrackTitle(t.title).toLowerCase();
-      const tArtist = (t.artist?.name || t.artists?.[0]?.name || '').toLowerCase();
-      const tAlbum = (t.album?.title || '').toLowerCase();
-      const tExplicit = !!t.explicit;
-      const tVersion = (t.version || '').toLowerCase();
+    const cleanTitleStr = cleanString(cleanTitle);
+    const cleanArtistStr = cleanString(cleanArtist);
+    const cleanAlbumStr = cleanString(cleanAlbum);
 
-      // 1. Title Match
-      if (tTitle === cleanTitle.toLowerCase()) score += 1000;
-      else if (tTitle.includes(cleanTitle.toLowerCase())) score += 500;
-      else score -= 1000;
+    // Strict scoring that keeps artist & title integrity
+    const scored = uniqueTracks
+      .map((t) => {
+        const tTitleStr = cleanString(t.title || '');
+        const tArtistName = t.artist?.name || t.artists?.[0]?.name || '';
+        const tArtistStr = cleanString(tArtistName);
+        const tAlbumTitle = t.album?.title || '';
+        const tAlbumStr = cleanString(tAlbumTitle);
+        const tExplicit = !!t.explicit;
+        const tVersion = (t.version || '').toLowerCase();
 
-      // 2. Artist Match
-      if (tArtist.includes(cleanArtist.toLowerCase()) || cleanArtist.toLowerCase().includes(tArtist)) {
-        score += 600;
-      } else {
-        score -= 800;
-      }
+        // 1. Mandatory Artist Gate (Disqualify different artists like the band "The Cure")
+        const artistMatches =
+          tArtistStr.includes(cleanArtistStr) ||
+          cleanArtistStr.includes(tArtistStr);
 
-      // 3. Album Match (Prefers the correct album edition over random singles)
-      if (cleanAlbum && (tAlbum.includes(cleanAlbum.toLowerCase()) || cleanAlbum.toLowerCase().includes(tAlbum))) {
-        score += 700;
-      }
+        if (!artistMatches) {
+          return { track: t, score: -10000 };
+        }
 
-      // 4. Strict Clean vs. Explicit Rating
-      if (isClean) {
-        if (!tExplicit) score += 3000; // Major priority for clean audio
-        if (CLEAN_REGEX.test(t.title) || CLEAN_REGEX.test(tVersion)) score += 1500;
-        if (tExplicit) score -= 5000; // Disqualify explicit version
-      } else {
-        if (tExplicit) score += 1500;
-        if (CLEAN_REGEX.test(t.title) || CLEAN_REGEX.test(tVersion)) score -= 1000;
-      }
+        // 2. Mandatory Title Gate
+        const titleMatches =
+          tTitleStr.includes(cleanTitleStr) ||
+          cleanTitleStr.includes(tTitleStr);
 
-      return { track: t, score };
-    });
+        if (!titleMatches) {
+          return { track: t, score: -10000 };
+        }
+
+        let score = 1000;
+
+        // 3. Exact Title match bonus
+        if (tTitleStr === cleanTitleStr) {
+          score += 500;
+        }
+
+        // 4. Album Match Bonus (Selects the album edition rather than standalone singles)
+        if (cleanAlbumStr && (tAlbumStr.includes(cleanAlbumStr) || cleanAlbumStr.includes(tAlbumStr))) {
+          score += 1500;
+        }
+
+        // 5. Clean vs Explicit Preference (Soft penalty so songs always play)
+        if (isClean) {
+          if (!tExplicit) score += 2000;
+          if (CLEAN_REGEX.test(t.title) || CLEAN_REGEX.test(tVersion)) score += 1000;
+          if (tExplicit) score -= 500; // Soft penalty: explicit can still be chosen if it's the only one
+        } else {
+          if (tExplicit) score += 1000;
+          if (CLEAN_REGEX.test(t.title) || CLEAN_REGEX.test(tVersion)) score -= 500;
+        }
+
+        return { track: t, score };
+      })
+      .filter((item) => item.score > -5000);
+
+    if (scored.length === 0) return null;
 
     scored.sort((a, b) => b.score - a.score);
-    return scored[0]?.track?.id || null;
+    return scored[0].track.id;
   } catch (error) {
     console.warn(`[Tidal] Search error: ${error.message}`);
   }
@@ -550,21 +571,17 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 
   if (targetIsClean) {
     if (videoIsClean) {
-      score += 2500;
+      score += 2000;
     }
     if (videoIsExplicit) {
-      score -= 4000;
+      score -= 1500;
     }
   } else if (targetIsExplicit) {
     if (videoIsExplicit) {
       score += 1500;
     }
     if (videoIsClean) {
-      score -= 2000;
-    }
-  } else {
-    if (videoIsClean) {
-      score -= 250;
+      score -= 1000;
     }
   }
 
@@ -1020,47 +1037,74 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Stream (Byte-Range Proxy with Full Metadata Support)
+// Audio Stream (Byte-Range Proxy with YouTube Fallback)
 app.get('/api/stream', async (req, res) => {
   try {
     let { trackId, title, artist, album, clean, explicit } = req.query;
-    if (!trackId && (!title || !artist)) return res.status(400).json({ error: 'trackId OR (title and artist) is required' });
+    if (!trackId && (!title || !artist)) {
+      return res.status(400).json({ error: 'trackId OR (title and artist) is required' });
+    }
 
-    const isClean = clean === 'true' || explicit === 'false' || isCleanTrack(title);
-
+    const isClean = clean === 'true' || isCleanTrack(title);
     let directStreamUrl = null;
+
+    // 1. Try direct Tidal trackId if provided
     if (trackId) {
       try {
         directStreamUrl = await getTidalStreamUrl(trackId);
       } catch (e) {
-        trackId = null;
+        directStreamUrl = null;
       }
     }
 
-    if (!trackId || !directStreamUrl) {
-      trackId = await searchTidalForTrack(title, artist, album || '', isClean);
-      if (!trackId) return res.status(404).json({ error: 'Track not found on Tidal' });
-      directStreamUrl = await getTidalStreamUrl(trackId);
+    // 2. Search Tidal if direct trackId failed or wasn't provided
+    if (!directStreamUrl && title && artist) {
+      try {
+        const foundTidalId = await searchTidalForTrack(title, artist, album || '', isClean);
+        if (foundTidalId) {
+          directStreamUrl = await getTidalStreamUrl(foundTidalId);
+        }
+      } catch (e) {
+        directStreamUrl = null;
+      }
+    }
+
+    // 3. Fallback: Stream directly from YouTube audio via yt-dlp if Tidal fails or is unavailable
+    if (!directStreamUrl && title && artist) {
+      const cleanQ = cleanTrackTitle(title);
+      const cleanArt = cleanTrackTitle(artist);
+      const ytQuery = isClean ? `${cleanQ} ${cleanArt} audio clean` : `${cleanQ} ${cleanArt} official audio`;
+      const ytVideos = await searchYouTubeNative(ytQuery);
+      if (ytVideos && ytVideos.length > 0) {
+        directStreamUrl = await resolveDirectYouTubeStream(ytVideos[0].videoId);
+      }
+    }
+
+    if (!directStreamUrl) {
+      return res.status(404).json({ error: 'Track audio stream unavailable.' });
     }
 
     const clientRange = req.headers.range || 'bytes=0-';
     const controller = new AbortController();
     req.on('close', () => controller.abort());
 
-    const tidalResponse = await fetch(directStreamUrl, {
-      headers: { 'Range': clientRange },
+    const upstreamRes = await fetch(directStreamUrl, {
+      headers: {
+        'Range': clientRange,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
       signal: controller.signal,
     });
 
-    res.status(tidalResponse.status);
+    res.status(upstreamRes.status);
     ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach((h) => {
-      const val = tidalResponse.headers.get(h);
+      const val = upstreamRes.headers.get(h);
       if (val) res.setHeader(h, val);
     });
     res.setHeader('Accept-Ranges', 'bytes');
 
     try {
-      await pipeline(Readable.fromWeb(tidalResponse.body), res);
+      await pipeline(Readable.fromWeb(upstreamRes.body), res);
     } catch (err) {}
   } catch (error) {
     console.error('[Stream Error]', error.message);
