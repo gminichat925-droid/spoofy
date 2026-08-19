@@ -8,7 +8,7 @@ const { Vibrant } = require('node-vibrant/node');
 const app = express();
 app.use(cors());
 
-// Credentials loaded from Railway / Server Environment Variables
+// Credentials loaded from Server Environment Variables
 const CLIENT_ID = process.env.TIDAL_CLIENT_ID || '4N3n6Q1x95LL5K7p';
 const CLIENT_SECRET = process.env.TIDAL_CLIENT_SECRET || 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=';
 const REFRESH_TOKEN = process.env.TIDAL_REFRESH_TOKEN;
@@ -67,7 +67,7 @@ function cleanString(str) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. TIDAL AUDIO STREAMING
+// 2. TIDAL AUDIO STREAMING (SMART CLEAN & ALBUM RESOLVER)
 // ─────────────────────────────────────────────────────────────
 
 async function getAccessToken() {
@@ -153,45 +153,85 @@ async function getTidalStreamUrl(trackId, quality = 'LOSSLESS') {
   throw new Error('No audio URL found in Tidal manifest.');
 }
 
-async function searchTidalForTrack(title, artist) {
+async function searchTidalForTrack(title, artist, album = '', isClean = false) {
   try {
     const token = await getAccessToken();
-    const isClean = isCleanTrack(title);
-    const isExplicit = isExplicitTrack(title);
     const cleanTitle = cleanTrackTitle(title);
+    const cleanArtist = cleanTrackTitle(artist);
+    const cleanAlbum = cleanTrackTitle(album);
 
-    const query = isClean ? `${cleanTitle} ${artist} Clean` : `${cleanTitle} ${artist}`;
-    const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(query)}&limit=15&types=TRACKS&countryCode=US`;
+    const searchQueries = [
+      isClean ? `${cleanTitle} ${cleanArtist} Clean` : null,
+      cleanAlbum ? `${cleanTitle} ${cleanArtist} ${cleanAlbum}` : null,
+      `${cleanTitle} ${cleanArtist}`,
+    ].filter(Boolean);
 
-    const searchRes = await fetch(searchUrl, {
-      headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
-      signal: AbortSignal.timeout(5000),
-    });
+    const allTracks = [];
+    for (const q of searchQueries) {
+      const searchUrl = `https://api.tidal.com/v1/search?query=${encodeURIComponent(q)}&limit=15&types=TRACKS&countryCode=US`;
+      const searchRes = await fetch(searchUrl, {
+        headers: { 'Authorization': `Bearer ${token}`, 'x-tidal-token': CLIENT_ID },
+        signal: AbortSignal.timeout(5000),
+      });
 
-    if (searchRes.ok) {
-      const searchData = await searchRes.json();
-      const rawItems = searchData.tracks?.items || searchData.items || [];
-      if (rawItems.length > 0) {
-        if (isClean) {
-          const cleanItem = rawItems.find(
-            (t) =>
-              CLEAN_REGEX.test(t.title || '') ||
-              CLEAN_REGEX.test(t.version || '') ||
-              t.explicit === false
-          );
-          if (cleanItem) return cleanItem.id;
-        } else if (isExplicit) {
-          const explicitItem = rawItems.find(
-            (t) =>
-              t.explicit === true ||
-              EXPLICIT_REGEX.test(t.title || '') ||
-              EXPLICIT_REGEX.test(t.version || '')
-          );
-          if (explicitItem) return explicitItem.id;
-        }
-        return rawItems[0].id;
+      if (searchRes.ok) {
+        const searchData = await searchRes.json();
+        const rawItems = searchData.tracks?.items || searchData.items || [];
+        allTracks.push(...rawItems);
       }
     }
+
+    if (allTracks.length === 0) return null;
+
+    // Deduplicate candidates
+    const seen = new Set();
+    const uniqueTracks = allTracks.filter((t) => {
+      if (seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    });
+
+    // Score Tidal candidates
+    const scored = uniqueTracks.map((t) => {
+      let score = 0;
+      const tTitle = cleanTrackTitle(t.title).toLowerCase();
+      const tArtist = (t.artist?.name || t.artists?.[0]?.name || '').toLowerCase();
+      const tAlbum = (t.album?.title || '').toLowerCase();
+      const tExplicit = !!t.explicit;
+      const tVersion = (t.version || '').toLowerCase();
+
+      // 1. Title Match
+      if (tTitle === cleanTitle.toLowerCase()) score += 1000;
+      else if (tTitle.includes(cleanTitle.toLowerCase())) score += 500;
+      else score -= 1000;
+
+      // 2. Artist Match
+      if (tArtist.includes(cleanArtist.toLowerCase()) || cleanArtist.toLowerCase().includes(tArtist)) {
+        score += 600;
+      } else {
+        score -= 800;
+      }
+
+      // 3. Album Match (Prefers the correct album edition over random singles)
+      if (cleanAlbum && (tAlbum.includes(cleanAlbum.toLowerCase()) || cleanAlbum.toLowerCase().includes(tAlbum))) {
+        score += 700;
+      }
+
+      // 4. Strict Clean vs. Explicit Rating
+      if (isClean) {
+        if (!tExplicit) score += 3000; // Major priority for clean audio
+        if (CLEAN_REGEX.test(t.title) || CLEAN_REGEX.test(tVersion)) score += 1500;
+        if (tExplicit) score -= 5000; // Disqualify explicit version
+      } else {
+        if (tExplicit) score += 1500;
+        if (CLEAN_REGEX.test(t.title) || CLEAN_REGEX.test(tVersion)) score -= 1000;
+      }
+
+      return { track: t, score };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0]?.track?.id || null;
   } catch (error) {
     console.warn(`[Tidal] Search error: ${error.message}`);
   }
@@ -199,7 +239,7 @@ async function searchTidalForTrack(title, artist) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3. YT-DLP DIRECT STREAM & SUBTITLE EXTRACTOR
+// 3. YT-DLP DIRECT STREAM & POSITIONAL SUBTITLES
 // ─────────────────────────────────────────────────────────────
 
 function getStreamUrlFromYtDlp(videoId) {
@@ -442,7 +482,7 @@ async function getYouTubeSubtitles(videoId, preferredLang = 'en') {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4. SCORING & CLASSIFICATION (WITH CLEAN / EXPLICIT BIAS)
+// 4. VIDEO SCORING ENGINE
 // ─────────────────────────────────────────────────────────────
 
 const DISQUALIFY_REGEX = /\b(behind the scenes|making of|bts|in the studio|trailer|teaser|snippet|preview|interview|vlog|track by track|unboxing|promo|commentary|reaction|reacts|review|parody|karaoke|instrumental|slowed|reverb|speed up|sped up|nightcore|1 hour|10 hours|8d audio|mashup|without cut scene|no dialogue|fan made|fan edit|remastered & lyrics|hd remastered|& lyrics|with lyrics|w\/ lyrics|color coded|sub español|legendado|4k 60fps)\b/i;
@@ -510,10 +550,10 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
 
   if (targetIsClean) {
     if (videoIsClean) {
-      score += 2500; // Dominant boost for clean video
+      score += 2500;
     }
     if (videoIsExplicit) {
-      score -= 4000; // Heavy penalty if explicit video returned
+      score -= 4000;
     }
   } else if (targetIsExplicit) {
     if (videoIsExplicit) {
@@ -523,9 +563,8 @@ function getYouTubeVideoScore(video, targetTitle, targetArtist, targetDurationSe
       score -= 2000;
     }
   } else {
-    // Neither clean nor explicit explicitly specified
     if (videoIsClean) {
-      score -= 250; // Standard official release preferred over clean radio edits
+      score -= 250;
     }
   }
 
@@ -981,18 +1020,29 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Audio Stream (Byte-Range Proxy)
+// Audio Stream (Byte-Range Proxy with Full Metadata Support)
 app.get('/api/stream', async (req, res) => {
   try {
-    let { trackId, title, artist } = req.query;
+    let { trackId, title, artist, album, clean, explicit } = req.query;
     if (!trackId && (!title || !artist)) return res.status(400).json({ error: 'trackId OR (title and artist) is required' });
 
-    if (!trackId) {
-      trackId = await searchTidalForTrack(title, artist);
-      if (!trackId) return res.status(404).json({ error: 'Track not found on Tidal' });
+    const isClean = clean === 'true' || explicit === 'false' || isCleanTrack(title);
+
+    let directStreamUrl = null;
+    if (trackId) {
+      try {
+        directStreamUrl = await getTidalStreamUrl(trackId);
+      } catch (e) {
+        trackId = null;
+      }
     }
 
-    const directStreamUrl = await getTidalStreamUrl(trackId);
+    if (!trackId || !directStreamUrl) {
+      trackId = await searchTidalForTrack(title, artist, album || '', isClean);
+      if (!trackId) return res.status(404).json({ error: 'Track not found on Tidal' });
+      directStreamUrl = await getTidalStreamUrl(trackId);
+    }
+
     const clientRange = req.headers.range || 'bytes=0-';
     const controller = new AbortController();
     req.on('close', () => controller.abort());
@@ -1141,7 +1191,7 @@ app.get('/api/video', async (req, res) => {
 // Official Matched YouTube Video (Music Video / Short Film / Lyric Video)
 app.get('/api/official-video', async (req, res) => {
   try {
-    const { title, artist, duration, preferType, clean } = req.query;
+    const { title, artist, album, duration, preferType, clean } = req.query;
     if (!title || !artist) return res.status(400).json({ error: 'title and artist required.' });
 
     const host = req.get('host');
@@ -1153,26 +1203,28 @@ app.get('/api/official-video', async (req, res) => {
 
     const cleanTitle = cleanTrackTitle(title);
     const cleanArtist = cleanTrackTitle(artist);
+    const cleanAlbum = cleanTrackTitle(album || '');
     const audioDurSec = Number(duration > 10000 ? duration / 1000 : duration) || 0;
 
     let queries = [];
     if (isClean) {
       queries = [
         `${cleanTitle} ${cleanArtist} clean official music video`,
-        `${cleanTitle} ${cleanArtist} clean official video`,
+        cleanAlbum ? `${cleanTitle} ${cleanArtist} ${cleanAlbum} clean` : null,
         `${cleanTitle} ${cleanArtist} clean version`,
         `${cleanTitle} ${cleanArtist} radio edit official video`,
         `${cleanTitle} ${cleanArtist} clean lyric video`,
         `${cleanTitle} ${cleanArtist} official music video`,
-      ];
+      ].filter(Boolean);
     } else {
       queries = [
         `${cleanTitle} ${cleanArtist} official music video`,
         `${cleanArtist} ${cleanTitle} official`,
+        cleanAlbum ? `${cleanTitle} ${cleanArtist} ${cleanAlbum}` : null,
         `${cleanArtist} ${cleanTitle} vevo`,
         `${cleanTitle} ${cleanArtist} short film`,
         `${cleanTitle} ${cleanArtist} lyric video`,
-      ];
+      ].filter(Boolean);
     }
 
     const responses = await Promise.all(queries.map((q) => searchYouTubeNative(q)));
